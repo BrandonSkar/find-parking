@@ -87,16 +87,41 @@ it ages, rather than pretending a two-hour-old number is still true.
 ## Why Seattle's data is baked into the repo
 
 The upstream dataset is a fixed 2021 study of roughly 40M rows. Filtering it by
-hour through Socrata takes **12–290 seconds per request** — measured, not
-guessed. That's unusable in an app.
+hour through Socrata takes **minutes per request** — measured, not guessed.
+That's unusable in an app.
 
 The data never changes, so `scripts/build-seattle-data.mjs` aggregates it once
 into a blockface × hour occupancy table that ships as a static file. It loads
 instantly and works offline, which is exactly what a PWA wants.
 
 ```bash
-node scripts/build-seattle-data.mjs   # regenerate data/seattle-occupancy.json
+node scripts/build-seattle-data.mjs   # writes data/seattle-occupancy.json
 ```
+
+The build runs in two phases, and the split is not arbitrary. The obvious
+query — group by blockface, location and hour in one shot — **never returns**.
+Socrata plans it happily, but grouping on the `location` Point column across
+40M rows pushes it past any timeout worth waiting for:
+
+| Query | Result |
+|---|---|
+| `$limit=5` | 0.7 s |
+| `$limit=100` | dead at 180 s |
+| group by blockface + hour, one hour at a time | 116 s |
+| group by blockface + **location** + hour | dead at 306 s |
+
+The small-limit case returning instantly is a trap — Socrata short-circuits it
+rather than computing the real aggregate.
+
+So phase 1 gets coordinates from a handful of exact-timestamp reads (readings
+land on whole hours, so equality on `occupancydatetime` is an indexed lookup —
+966 blockfaces in under 3 seconds), and phase 2 walks the 24 hours one query at
+a time with `location` kept out of the `GROUP BY`. Roughly 45 minutes total,
+once, offline.
+
+> If `data/seattle-occupancy.json` is absent the Seattle source simply
+> contributes nothing and OpenStreetMap still covers the city. Nothing errors,
+> and no other city is affected.
 
 The same pattern works for any city that publishes a historical occupancy study.
 
