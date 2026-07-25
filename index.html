@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no" />
+<title>Find Parking 🅿️</title>
+<link rel="stylesheet" href="vendor/leaflet/leaflet.css" />
+<link rel="stylesheet" href="styles.css" />
+
+<!-- PWA / Add to Home Screen -->
+<link rel="manifest" href="manifest.webmanifest" />
+<meta name="theme-color" content="#0b1220" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Parking" />
+<link rel="apple-touch-icon" href="apple-touch-icon.png" />
+<link rel="icon" href="icon-192.png" />
+<meta name="description" content="Find parking near you — live sensor data where it exists, informed predictions everywhere else." />
+</head>
+<body>
+
+<div id="map"></div>
+
+<!-- ===================== TOP BAR ===================== -->
+<header class="topbar">
+  <form id="searchForm" class="search">
+    <button type="button" id="locateBtn" class="icon-btn" title="Use my location" aria-label="Use my location">➤</button>
+    <input id="searchInput" type="search" placeholder="Search a place or address" autocomplete="off" />
+    <button type="submit" class="icon-btn" title="Search" aria-label="Search">🔍</button>
+  </form>
+  <div id="geoResults" class="geo-results hidden"></div>
+</header>
+
+<!-- ===================== STATUS PILL ===================== -->
+<div id="status" class="status hidden"></div>
+
+<!-- ===================== BOTTOM SHEET ===================== -->
+<section id="sheet" class="sheet">
+  <div class="sheet-grip" id="sheetGrip"><span></span></div>
+
+  <div class="sheet-head">
+    <div>
+      <h1 id="sheetTitle">Parking near you</h1>
+      <p id="sheetSub" class="sub">Tap ➤ to search where you are</p>
+    </div>
+    <button id="settingsBtn" class="icon-btn ghost" title="Settings" aria-label="Settings">⚙︎</button>
+  </div>
+
+  <div class="filters">
+    <button class="chip" data-filter="walk">🚶 <span id="walkLabel">800 m</span></button>
+    <button class="chip" data-filter="free">💸 Free only</button>
+    <button class="chip active" data-filter="legal">✅ Legal now</button>
+    <button class="chip" id="refreshBtn">↻ Refresh</button>
+  </div>
+
+  <ul id="list" class="list"></ul>
+
+  <div id="sourceNote" class="source-note"></div>
+</section>
+
+<!-- ===================== SPOT DETAIL ===================== -->
+<section id="detail" class="detail hidden" role="dialog" aria-modal="true">
+  <button id="detailClose" class="detail-close" aria-label="Close">✕</button>
+  <div id="detailBody"></div>
+</section>
+
+<!-- ===================== SETTINGS ===================== -->
+<section id="settings" class="detail hidden" role="dialog" aria-modal="true">
+  <button id="settingsClose" class="detail-close" aria-label="Close">✕</button>
+  <div class="detail-inner">
+    <h2>Settings</h2>
+
+    <label class="field">
+      <span>Max walk distance</span>
+      <input type="range" id="walkRange" min="200" max="2000" step="100" />
+      <output id="walkOut"></output>
+    </label>
+
+    <h3>Optional data providers</h3>
+    <p class="hint">
+      The app works with no keys at all. These add extra coverage.
+      Keys are stored only on this device — but a static site can't hide them
+      from the browser, so restrict any key you paste here to your Pages domain.
+    </p>
+
+    <label class="field">
+      <span>Google Places API key</span>
+      <input type="password" id="googleKey" placeholder="AIza…" autocomplete="off" />
+    </label>
+    <label class="field">
+      <span>SpotHero partner token</span>
+      <input type="password" id="spotheroKey" placeholder="partner token" autocomplete="off" />
+    </label>
+    <label class="field">
+      <span>INRIX access token</span>
+      <input type="password" id="inrixToken" placeholder="bearer token" autocomplete="off" />
+    </label>
+    <label class="field">
+      <span>Crowd-report sync URL <em>(optional)</em></span>
+      <input type="url" id="syncUrl" placeholder="https://…/api/report" autocomplete="off" />
+    </label>
+
+    <button id="saveSettings" class="primary-btn">Save</button>
+
+    <h3>Where the data comes from</h3>
+    <ul class="src-list" id="srcList"></ul>
+  </div>
+</section>
+
+<button id="installBtn" class="install-btn hidden">⬇︎ Add to Home Screen</button>
+
+<script src="vendor/leaflet/leaflet.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>

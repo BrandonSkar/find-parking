@@ -1,0 +1,656 @@
+// sources.js — parking data adapters.
+//
+// Every adapter takes a search area and returns Spot[] in one shared shape.
+// Adapters are ranked by how much they actually KNOW:
+//
+//   measured  — a sensor or live inventory says how many spaces are open now
+//   predicted — we know the place exists, availability is inferred
+//   unknown   — we know it exists, nothing more
+//
+// Adapters that need a paid key are registered but stay dormant until a key is
+// present in settings, so the app is fully functional with zero keys.
+
+const OVERPASS_HOSTS = [
+  "https://overpass-api.de/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+  "https://overpass.private.coffee/api/interpreter",
+];
+
+// overpass-api.de answers 406 unless BOTH Accept and User-Agent are present.
+// Browsers set User-Agent themselves and ignore attempts to override it, so
+// this header only actually does anything under Node (scripts/smoke.mjs) —
+// it is harmless in the browser and required outside it.
+const OVERPASS_HEADERS = {
+  "Content-Type": "application/x-www-form-urlencoded",
+  Accept: "application/json",
+  "User-Agent": "FindParking/1.0 (static PWA; OSM data consumer)",
+};
+
+// ---------------------------------------------------------------- shared shape
+
+export function makeSpot(o) {
+  return {
+    id: o.id,
+    source: o.source,
+    name: o.name || null,
+    lat: o.lat,
+    lon: o.lon,
+    kind: o.kind || "lot", // garage | lot | street | meter
+    capacity: o.capacity ?? null, // total spaces, if known
+    fee: o.fee ?? null, // true | false | null(unknown)
+    access: o.access ?? null, // yes | private | customers | permit
+    maxStay: o.maxStay ?? null, // minutes
+    covered: o.covered ?? null,
+    rate: o.rate ?? null, // { min, max, currency }
+    hours: o.hours ?? null, // OSM opening_hours string
+    live: o.live ?? null, // { free, total, at:Date } — MEASURED
+    tags: o.tags || {},
+  };
+}
+
+// --------------------------------------------------------------------- helpers
+
+async function fetchJSON(url, opts = {}, timeoutMs = 25000) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { ...opts, signal: ctl.signal });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.json();
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// Overpass mirrors rate-limit (429) and go down constantly. Try each in turn;
+// a 429 from one mirror is normal, not a failure worth surfacing.
+async function overpass(query) {
+  let lastErr;
+  for (const host of OVERPASS_HOSTS) {
+    try {
+      return await fetchJSON(
+        host,
+        { method: "POST", headers: OVERPASS_HEADERS, body: "data=" + encodeURIComponent(query) },
+        30000
+      );
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw new Error(
+    `all Overpass mirrors unavailable (last: ${lastErr?.message || "unknown"})`
+  );
+}
+
+const num = (v) => {
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : null;
+};
+
+// OSM maxstay: "2 h", "30 min", "90"
+function parseMaxStay(v) {
+  if (!v) return null;
+  const s = String(v).toLowerCase().trim();
+  if (s === "unlimited" || s === "no") return null;
+  const m = s.match(/([\d.]+)\s*(h|hour|hours|min|minute|minutes|day|days)?/);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  if (!Number.isFinite(n)) return null;
+  const unit = m[2] || "h";
+  if (unit.startsWith("h")) return n * 60;
+  if (unit.startsWith("d")) return n * 60 * 24;
+  return n;
+}
+
+// "$2.00 - $4.00" / "$1.50"  ->  { min, max, currency }
+function parseRateRange(v) {
+  if (!v) return null;
+  const nums = String(v).match(/[\d.]+/g);
+  if (!nums || !nums.length) return null;
+  const vals = nums.map(parseFloat).filter(Number.isFinite);
+  if (!vals.length) return null;
+  return { min: Math.min(...vals), max: Math.max(...vals), currency: "USD" };
+}
+
+export function distanceMeters(a, b) {
+  const R = 6371000;
+  const dLat = ((b.lat - a.lat) * Math.PI) / 180;
+  const dLon = ((b.lon - a.lon) * Math.PI) / 180;
+  const la1 = (a.lat * Math.PI) / 180;
+  const la2 = (b.lat * Math.PI) / 180;
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(la1) * Math.cos(la2) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+function bbox(center, radiusM) {
+  const dLat = radiusM / 111320;
+  const dLon = radiusM / (111320 * Math.cos((center.lat * Math.PI) / 180) || 1);
+  return {
+    south: center.lat - dLat,
+    west: center.lon - dLon,
+    north: center.lat + dLat,
+    east: center.lon + dLon,
+  };
+}
+
+// =============================================================================
+// 1. OpenStreetMap / Overpass — the base layer. Free, no key, worldwide.
+//    Knows WHERE parking is + capacity/fee/access/hours. Not real-time.
+// =============================================================================
+
+const osmSource = {
+  id: "osm",
+  label: "OpenStreetMap",
+  tier: "predicted",
+  needsKey: false,
+  attribution: "© OpenStreetMap contributors (ODbL)",
+
+  async fetch({ center, radiusM }) {
+    const b = bbox(center, radiusM);
+    const box = `${b.south},${b.west},${b.north},${b.east}`;
+    // Lots/garages, plus street-side parking mapped with the newer
+    // parking:both/left/right street schema.
+    const q = `[out:json][timeout:25];
+(
+  nwr["amenity"="parking"](${box});
+  way["parking:both"](${box});
+  way["parking:left"](${box});
+  way["parking:right"](${box});
+);
+out center tags 400;`;
+
+    const data = await overpass(q);
+    const spots = [];
+
+    for (const el of data.elements || []) {
+      const t = el.tags || {};
+      const lat = el.lat ?? el.center?.lat;
+      const lon = el.lon ?? el.center?.lon;
+      if (lat == null || lon == null) continue;
+
+      const isStreet =
+        !t.amenity &&
+        (t["parking:both"] || t["parking:left"] || t["parking:right"]);
+
+      // Skip street segments where parking is explicitly absent.
+      if (isStreet) {
+        const vals = [
+          t["parking:both"],
+          t["parking:left"],
+          t["parking:right"],
+        ].filter(Boolean);
+        if (vals.every((v) => v === "no" || v === "separate")) continue;
+      }
+
+      let kind = "lot";
+      if (isStreet) kind = "street";
+      else if (t.parking === "underground" || t.parking === "multi-storey")
+        kind = "garage";
+      else if (t.parking === "street_side" || t.parking === "lane")
+        kind = "street";
+
+      spots.push(
+        makeSpot({
+          id: `osm:${el.type}/${el.id}`,
+          source: "osm",
+          name: t.name || (isStreet ? t["name"] || "Street parking" : null),
+          lat,
+          lon,
+          kind,
+          capacity: num(t.capacity),
+          fee: t.fee === "yes" ? true : t.fee === "no" ? false : null,
+          access: t.access || null,
+          maxStay: parseMaxStay(t.maxstay),
+          covered:
+            t.covered === "yes" ||
+            t.parking === "underground" ||
+            t.parking === "multi-storey" ||
+            null,
+          hours: t.opening_hours || null,
+          rate: parseRateRange(t.charge),
+          tags: t,
+        })
+      );
+    }
+    return spots;
+  },
+};
+
+// =============================================================================
+// 2. Los Angeles LADOT — REAL-TIME on-street sensor occupancy. Free, no key.
+//    This is the rare case of true measured street availability.
+//    Occupancy feed is space-level; joined to the meter inventory for coords.
+// =============================================================================
+
+const LA_BOUNDS = { south: 33.6, west: -118.7, north: 34.4, east: -118.1 };
+const LA_OCCUPANCY = "https://data.lacity.org/resource/e7h6-4a3e.json";
+const LA_INVENTORY = "https://data.lacity.org/resource/s49e-q6j2.json";
+
+// LADOT stamps readings as "2026-07-25T19:34:26.000" with NO zone designator.
+// Those values are UTC, but `new Date(s)` on a bare timestamp applies the
+// VIEWER's local timezone instead — which misdates every reading by the user's
+// UTC offset. In Pacific that makes live counts appear ~7 hours in the future,
+// so freshness decay and the crowd-report-vs-sensor comparison both break.
+// Verified against the live feed: read as UTC, readings come back ~1 min old.
+function parseFeedTime(s) {
+  if (!s) return null;
+  const hasZone = /[Zz]$|[+-]\d{2}:?\d{2}$/.test(s);
+  const d = new Date(hasZone ? s : s + "Z");
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+let laInventoryCache = null; // spaceId -> meter meta (rarely changes)
+
+async function loadLAInventory() {
+  if (laInventoryCache) return laInventoryCache;
+  const rows = await fetchJSON(
+    `${LA_INVENTORY}?$limit=50000&$select=spaceid,blockface,raterange,timelimit,metertype,latlng`
+  );
+  const map = new Map();
+  for (const r of rows) {
+    const lat = num(r.latlng?.latitude);
+    const lon = num(r.latlng?.longitude);
+    if (lat == null || lon == null) continue;
+    map.set(r.spaceid, {
+      lat,
+      lon,
+      blockface: r.blockface,
+      rate: parseRateRange(r.raterange),
+      maxStay: parseMaxStay(r.timelimit),
+    });
+  }
+  laInventoryCache = map;
+  return map;
+}
+
+const laSource = {
+  id: "la",
+  label: "LA LADOT live meters",
+  tier: "measured",
+  needsKey: false,
+  attribution: "City of Los Angeles / LADOT open data",
+
+  covers({ center }) {
+    return (
+      center.lat >= LA_BOUNDS.south &&
+      center.lat <= LA_BOUNDS.north &&
+      center.lon >= LA_BOUNDS.west &&
+      center.lon <= LA_BOUNDS.east
+    );
+  },
+
+  async fetch({ center, radiusM }) {
+    const inv = await loadLAInventory();
+    const occ = await fetchJSON(`${LA_OCCUPANCY}?$limit=50000`);
+
+    // Group live space states into block-level meter groups — a driver cares
+    // "is there a spot on this block", not about one specific space.
+    const blocks = new Map();
+    for (const row of occ) {
+      const meta = inv.get(row.spaceid);
+      if (!meta) continue;
+      if (distanceMeters(center, meta) > radiusM) continue;
+
+      const key = meta.blockface || row.spaceid;
+      let b = blocks.get(key);
+      if (!b) {
+        b = {
+          key,
+          lat: meta.lat,
+          lon: meta.lon,
+          free: 0,
+          total: 0,
+          rate: meta.rate,
+          maxStay: meta.maxStay,
+          at: null,
+        };
+        blocks.set(key, b);
+      }
+      b.total++;
+      if (String(row.occupancystate).toUpperCase() === "VACANT") b.free++;
+      const ts = parseFeedTime(row.eventtime);
+      if (ts && (!b.at || ts > b.at)) b.at = ts;
+    }
+
+    return [...blocks.values()].map((b) =>
+      makeSpot({
+        id: `la:${b.key}`,
+        source: "la",
+        name: titleCase(b.key),
+        lat: b.lat,
+        lon: b.lon,
+        kind: "meter",
+        capacity: b.total,
+        fee: true,
+        rate: b.rate,
+        maxStay: b.maxStay,
+        live: { free: b.free, total: b.total, at: b.at || new Date() },
+      })
+    );
+  },
+};
+
+// =============================================================================
+// 3. Seattle — historical paid-parking occupancy, PRECOMPUTED.
+//
+//    Not live, but real observed occupancy per blockface per hour, which beats
+//    a generic demand curve by a mile. The upstream dataset is a fixed 2021
+//    study of ~40M rows and filtering it by hour through Socrata takes 12-290s
+//    per request, so scripts/build-seattle-data.mjs aggregates it once into a
+//    static table that ships with the site. Loads instantly, works offline.
+// =============================================================================
+
+const SEA_BOUNDS = { south: 47.4, west: -122.5, north: 47.8, east: -122.2 };
+
+let seaTable = null; // lazily loaded, then kept for the session
+
+// The table is optional: it's produced by an offline build step, and the app is
+// perfectly usable without it (OSM still covers Seattle). If it isn't there we
+// record that once and stay quiet, rather than reporting a failure every search.
+async function loadSeattleTable() {
+  if (seaTable) return seaTable;
+  const url = new URL("data/seattle-occupancy.json", import.meta.url).href;
+  try {
+    seaTable = await fetchJSON(url, {}, 15000);
+  } catch {
+    seaTable = { blocks: [], missing: true };
+    console.info(
+      "[find-parking] data/seattle-occupancy.json not present — " +
+        "run `node scripts/build-seattle-data.mjs` to enable Seattle history."
+    );
+  }
+  return seaTable;
+}
+
+const seattleSource = {
+  id: "seattle",
+  label: "Seattle occupancy history",
+  tier: "predicted",
+  needsKey: false,
+  attribution: "City of Seattle open data (2021 paid parking study)",
+
+  covers({ center }) {
+    return (
+      center.lat >= SEA_BOUNDS.south &&
+      center.lat <= SEA_BOUNDS.north &&
+      center.lon >= SEA_BOUNDS.west &&
+      center.lon <= SEA_BOUNDS.east
+    );
+  },
+
+  async fetch({ center, radiusM }) {
+    const table = await loadSeattleTable();
+    const hour = new Date().getHours();
+
+    const out = [];
+    for (const b of table.blocks) {
+      if (distanceMeters(center, b) > radiusM) continue;
+
+      // Fall back to the nearest hour we have a reading for.
+      let free = b.h[hour];
+      if (free == null) {
+        for (let d = 1; d <= 3 && free == null; d++) {
+          free = b.h[hour - d] ?? b.h[hour + d];
+        }
+      }
+      if (free == null) continue;
+
+      out.push(
+        makeSpot({
+          id: `sea:${b.n}`,
+          source: "seattle",
+          name: titleCase(b.n),
+          lat: b.lat,
+          lon: b.lon,
+          kind: "meter",
+          capacity: b.sp,
+          fee: true,
+          // Historical, not live — the engine weighs this as a strong prior.
+          tags: { _histFreeRatio: free, _histHour: hour },
+        })
+      );
+    }
+    return out;
+  },
+};
+
+// Municipal datasets shout their street names in caps; soften for display.
+function titleCase(s) {
+  return String(s)
+    .toLowerCase()
+    .replace(/\b[a-z]/g, (c) => c.toUpperCase())
+    .replace(/\bBetween\b/g, "between")
+    .replace(/\bAnd\b/g, "and");
+}
+
+// =============================================================================
+// 4. Key-gated commercial providers.
+//    These stay dormant until a key is saved in Settings. Each one is a small
+//    adapter so swapping providers never touches the UI or the engine.
+//
+//    NOTE: browser-side keys are visible to anyone using the app. Restrict them
+//    (HTTP-referrer allowlist) or proxy them. See README.
+// =============================================================================
+
+const googleSource = {
+  id: "google",
+  label: "Google Places",
+  tier: "predicted",
+  needsKey: true,
+  keyName: "googleKey",
+  attribution: "Google",
+
+  // Google gives parking *difficulty* + which parking types a place has —
+  // not live counts. Useful as a demand signal layered onto OSM geometry.
+  async fetch({ center, radiusM, key }) {
+    const body = {
+      includedTypes: ["parking"],
+      maxResultCount: 20,
+      locationRestriction: {
+        circle: {
+          center: { latitude: center.lat, longitude: center.lon },
+          radius: Math.min(radiusM, 50000),
+        },
+      },
+    };
+    const data = await fetchJSON("https://places.googleapis.com/v1/places:searchNearby", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": key,
+        "X-Goog-FieldMask":
+          "places.id,places.displayName,places.location,places.parkingOptions,places.currentOpeningHours.openNow",
+      },
+      body: JSON.stringify(body),
+    });
+
+    return (data.places || []).map((p) => {
+      const po = p.parkingOptions || {};
+      return makeSpot({
+        id: `g:${p.id}`,
+        source: "google",
+        name: p.displayName?.text || null,
+        lat: p.location.latitude,
+        lon: p.location.longitude,
+        kind: "lot",
+        fee: po.paidParkingLot || po.paidStreetParking ? true
+          : po.freeParkingLot || po.freeStreetParking ? false
+          : null,
+        tags: { _openNow: p.currentOpeningHours?.openNow, ...po },
+      });
+    });
+  },
+};
+
+// Real bookable inventory — the only fully reliable "yes, a space is yours".
+// Requires a partner agreement; adapter is here so wiring one up is a key away.
+const spotheroSource = {
+  id: "spothero",
+  label: "SpotHero (bookable)",
+  tier: "measured",
+  needsKey: true,
+  keyName: "spotheroKey",
+  attribution: "SpotHero",
+  async fetch({ center, radiusM, key }) {
+    const url =
+      `https://api.spothero.com/v1/facilities/rates?` +
+      `latitude=${center.lat}&longitude=${center.lon}&radius=${radiusM}`;
+    const data = await fetchJSON(url, {
+      headers: { Authorization: `Bearer ${key}` },
+    });
+    return (data.results || []).map((f) =>
+      makeSpot({
+        id: `sh:${f.facility?.id ?? f.id}`,
+        source: "spothero",
+        name: f.facility?.title || f.title,
+        lat: f.facility?.latitude ?? f.latitude,
+        lon: f.facility?.longitude ?? f.longitude,
+        kind: "garage",
+        fee: true,
+        rate: f.rates?.[0]
+          ? {
+              min: f.rates[0].price / 100,
+              max: f.rates[0].price / 100,
+              currency: "USD",
+            }
+          : null,
+        live: { free: f.available ?? 1, total: f.spaces ?? 1, at: new Date() },
+        tags: { bookable: true, url: f.facility?.url },
+      })
+    );
+  },
+};
+
+// INRIX is the broadest true real-time occupancy provider (on- and off-street).
+const inrixSource = {
+  id: "inrix",
+  label: "INRIX occupancy",
+  tier: "measured",
+  needsKey: true,
+  keyName: "inrixToken",
+  attribution: "INRIX",
+  async fetch({ center, radiusM, key }) {
+    const url =
+      `https://api.iq.inrix.com/lots/v3?point=${center.lat}%7C${center.lon}` +
+      `&radius=${Math.round(radiusM)}`;
+    const data = await fetchJSON(url, {
+      headers: { Authorization: `Bearer ${key}` },
+    });
+    return (data.result?.lots || []).map((l) =>
+      makeSpot({
+        id: `inrix:${l.id}`,
+        source: "inrix",
+        name: l.name,
+        lat: l.point?.lat ?? l.latitude,
+        lon: l.point?.lon ?? l.longitude,
+        kind: "garage",
+        capacity: l.spacesTotal ?? null,
+        fee: true,
+        live:
+          l.availability?.spacesAvailable != null
+            ? {
+                free: l.availability.spacesAvailable,
+                total: l.spacesTotal ?? l.availability.spacesAvailable,
+                at: new Date(),
+              }
+            : null,
+      })
+    );
+  },
+};
+
+// =============================================================================
+// Registry + orchestration
+// =============================================================================
+
+export const SOURCES = [
+  osmSource,
+  laSource,
+  seattleSource,
+  googleSource,
+  spotheroSource,
+  inrixSource,
+];
+
+/**
+ * Query every applicable source in parallel. One source failing never fails
+ * the search — parking data is patchy by nature and partial results beat none.
+ *
+ * @returns {{spots:Spot[], reports:{source,label,ok,count,error}[]}}
+ */
+export async function findParking({ center, radiusM = 800, keys = {} }) {
+  const active = SOURCES.filter((s) => {
+    if (s.needsKey && !keys[s.keyName]) return false;
+    if (s.covers && !s.covers({ center })) return false;
+    return true;
+  });
+
+  const settled = await Promise.allSettled(
+    active.map((s) => s.fetch({ center, radiusM, key: keys[s.keyName] }))
+  );
+
+  const spots = [];
+  const reports = [];
+  settled.forEach((res, i) => {
+    const s = active[i];
+    if (res.status === "fulfilled") {
+      const near = res.value.filter(
+        (sp) => distanceMeters(center, sp) <= radiusM * 1.15
+      );
+      spots.push(...near);
+      reports.push({ source: s.id, label: s.label, ok: true, count: near.length });
+    } else {
+      reports.push({
+        source: s.id,
+        label: s.label,
+        ok: false,
+        count: 0,
+        error: res.reason?.message || String(res.reason),
+      });
+    }
+  });
+
+  return { spots: dedupe(spots), reports };
+}
+
+// Sources overlap — a garage can appear in OSM, Google and SpotHero at once.
+// Collapse anything within ~35 m, keeping the entry that knows the most and
+// folding in fields the winner is missing.
+function dedupe(spots) {
+  const rank = { measured: 3, predicted: 2, unknown: 1 };
+  const tierOf = (sp) =>
+    sp.live ? 3 : rank[SOURCES.find((s) => s.id === sp.source)?.tier] || 1;
+
+  const out = [];
+  for (const sp of spots.sort((a, b) => tierOf(b) - tierOf(a))) {
+    const near = out.find(
+      (o) => o.kind === sp.kind && distanceMeters(o, sp) < 35
+    );
+    if (!near) {
+      out.push({ ...sp, mergedFrom: [sp.source] });
+      continue;
+    }
+    near.mergedFrom.push(sp.source);
+    for (const f of ["name", "capacity", "fee", "rate", "hours", "maxStay", "access"]) {
+      if (near[f] == null && sp[f] != null) near[f] = sp[f];
+    }
+    near.tags = { ...sp.tags, ...near.tags };
+  }
+  return out;
+}
+
+// Free geocoding for the search box. Nominatim asks for modest use — we only
+// call it on explicit submit, never per keystroke.
+export async function geocode(query) {
+  const url =
+    "https://nominatim.openstreetmap.org/search?format=json&limit=5&q=" +
+    encodeURIComponent(query);
+  const rows = await fetchJSON(url, { headers: { Accept: "application/json" } });
+  return rows.map((r) => ({
+    label: r.display_name,
+    lat: parseFloat(r.lat),
+    lon: parseFloat(r.lon),
+  }));
+}

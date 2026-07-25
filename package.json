@@ -1,0 +1,16 @@
+{
+  "name": "find-parking",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Static installable PWA that finds parking — live sensor data where it exists, explainable estimates everywhere else.",
+  "scripts": {
+    "start": "npx --yes serve .",
+    "smoke": "node scripts/smoke.mjs",
+    "icons": "node scripts/make-icons.mjs",
+    "build:seattle": "node scripts/build-seattle-data.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
