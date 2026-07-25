@@ -116,8 +116,11 @@ rather than computing the real aggregate.
 So phase 1 gets coordinates from a handful of exact-timestamp reads (readings
 land on whole hours, so equality on `occupancydatetime` is an indexed lookup —
 966 blockfaces in under 3 seconds), and phase 2 walks the 24 hours one query at
-a time with `location` kept out of the `GROUP BY`. Roughly 45 minutes total,
-once, offline.
+a time with `location` kept out of the `GROUP BY`.
+
+The committed table is **966 blockfaces × 11,388 blockface-hours in 200 KB**,
+built in 34 minutes. Hours 0–7 come back empty because Seattle's paid parking
+runs roughly 8am–8pm; that's the data telling the truth, not a gap.
 
 > If `data/seattle-occupancy.json` is absent the Seattle source simply
 > contributes nothing and OpenStreetMap still covers the city. Nothing errors,
