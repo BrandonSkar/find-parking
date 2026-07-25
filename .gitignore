@@ -5,4 +5,4 @@ Thumbs.db
 .vercel
 .env
 .env.local
-scripts/_*.mjs
+scripts/_*

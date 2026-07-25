@@ -32,6 +32,7 @@ const DEFAULT_SETTINGS = {
   mustBeLegal: true,
   keys: {}, // googleKey, spotheroKey, inrixToken
   syncUrl: "", // optional POST endpoint for crowd reports
+  installDismissed: false, // hid the install banner; Settings can bring it back
 };
 
 export function getSettings() {

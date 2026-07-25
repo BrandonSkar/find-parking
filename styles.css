@@ -453,22 +453,50 @@ html, body {
 
 .parked-pin { font-size: 24px; text-align: center; line-height: 30px; filter: drop-shadow(0 2px 4px rgba(0,0,0,.6)); }
 
-.install-btn {
+/* The install banner floats over the map, so it pairs the action with an
+   explicit dismiss. Hiding it is remembered; Settings brings it back. */
+.install-bar {
   position: fixed;
   left: 50%;
   bottom: calc(var(--sheet-h) + 12px + var(--safe-b));
   transform: translateX(-50%);
   z-index: 700;
+  display: flex;
+  align-items: stretch;
+  border-radius: 999px;
+  overflow: hidden;
+  box-shadow: 0 6px 20px rgba(0,0,0,.5);
+}
+
+.install-btn {
   background: var(--accent);
   color: #04101f;
   border: 0;
-  border-radius: 999px;
-  padding: 10px 18px;
+  padding: 10px 14px 10px 18px;
   font-weight: 650;
   font-size: 13px;
+  white-space: nowrap;
   cursor: pointer;
-  box-shadow: 0 6px 20px rgba(0,0,0,.5);
 }
+.install-btn:active { filter: brightness(.93); }
+
+.install-dismiss {
+  background: var(--accent);
+  /* Dim the glyph, not the element — opacity here would lighten the pill
+     background too and split it into two visibly different shades. */
+  color: rgba(4,16,31,.6);
+  border: 0;
+  border-left: 1px solid rgba(4,16,31,.18);
+  padding: 0 13px;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+.install-dismiss:hover { color: #04101f; }
+
+.install-row { display: flex; flex-direction: column; gap: 8px; margin-bottom: 6px; }
+.install-row .primary-btn { flex: none; }
+.install-row .hint { margin: 0; }
 
 @media (min-width: 860px) {
   :root { --sheet-h: 100vh; }
@@ -485,7 +513,7 @@ html, body {
   .sheet.collapsed { transform: none; }
   .sheet-grip { display: none; }
   .topbar { right: 420px; }
-  .install-btn { bottom: 20px; left: 30%; }
+  .install-bar { bottom: 20px; left: 30%; }
 }
 
 /* Respect a light-theme preference without losing map contrast. */

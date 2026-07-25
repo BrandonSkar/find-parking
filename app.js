@@ -502,6 +502,8 @@ $("settingsBtn").addEventListener("click", () => {
   $("inrixToken").value = s.keys.inrixToken || "";
   $("syncUrl").value = s.syncUrl || "";
 
+  refreshInstallUi();
+
   $("srcList").innerHTML = SOURCES.map((src) => {
     const on = !src.needsKey || !!s.keys[src.keyName];
     return `<li class="${on ? "on" : "off"}">
@@ -561,18 +563,91 @@ if ("serviceWorker" in navigator) {
   );
 }
 
+// The install banner sits over the map, so it has to be dismissable — but
+// dismissing it must not be a one-way door. Hiding is remembered across
+// sessions and Settings always offers a way back.
+
 let deferredPrompt = null;
+
+const isInstalled = () =>
+  window.matchMedia("(display-mode: standalone)").matches ||
+  navigator.standalone === true;
+
+// Safari never fires beforeinstallprompt, so there is nothing to trigger and
+// the only honest thing to show is where the button lives.
+const isIosSafari = () =>
+  /iphone|ipad|ipod/i.test(navigator.userAgent) && !/crios|fxios/i.test(navigator.userAgent);
+
+function refreshInstallUi() {
+  const canPrompt = !!deferredPrompt;
+  const dismissed = !!state.settings.installDismissed;
+  const installed = isInstalled();
+
+  $("installBar").classList.toggle("hidden", installed || dismissed || !canPrompt);
+
+  // Settings mirrors the same state and is the way back after a dismiss.
+  const row = $("installRow");
+  if (!row) return;
+  if (installed) {
+    row.innerHTML = `<p class="hint">✅ Installed — you're running the app version.</p>`;
+  } else if (canPrompt) {
+    row.innerHTML = dismissed
+      ? `<p class="hint">The install banner is hidden.</p>
+         <button type="button" id="installFromSettings" class="primary-btn">⬇︎ Add to Home Screen</button>
+         <button type="button" id="installUnhide" class="primary-btn ghost-btn">Show the banner again</button>`
+      : `<button type="button" id="installFromSettings" class="primary-btn">⬇︎ Add to Home Screen</button>`;
+  } else if (isIosSafari()) {
+    row.innerHTML = `<p class="hint">On iOS: tap <b>Share</b> → <b>Add to Home Screen</b>.
+      Safari doesn't let a site offer this as a button.</p>`;
+  } else {
+    row.innerHTML = `<p class="hint">Your browser hasn't offered an install prompt.
+      It appears once the browser decides the app qualifies, or if it's already installed.</p>`;
+  }
+}
+
+async function promptInstall() {
+  if (!deferredPrompt) return;
+  const e = deferredPrompt;
+  // The event is single-use: consumed whether or not they accept.
+  deferredPrompt = null;
+  e.prompt();
+  await e.userChoice.catch(() => {});
+  refreshInstallUi();
+}
+
 window.addEventListener("beforeinstallprompt", (e) => {
   e.preventDefault();
   deferredPrompt = e;
-  $("installBtn").classList.remove("hidden");
+  refreshInstallUi();
 });
-$("installBtn").addEventListener("click", async () => {
-  $("installBtn").classList.add("hidden");
-  if (!deferredPrompt) return;
-  deferredPrompt.prompt();
+
+window.addEventListener("appinstalled", () => {
   deferredPrompt = null;
+  // Installing supersedes any earlier dismiss — clear it so an uninstall
+  // later starts from a clean slate rather than a silently hidden banner.
+  state.settings = saveSettings({ installDismissed: false });
+  refreshInstallUi();
 });
+
+$("installBtn").addEventListener("click", promptInstall);
+
+$("installDismiss").addEventListener("click", () => {
+  state.settings = saveSettings({ installDismissed: true });
+  refreshInstallUi();
+});
+
+// Settings buttons are re-rendered on every refresh, so delegate.
+$("installRow").addEventListener("click", (e) => {
+  if (e.target.closest("#installFromSettings")) {
+    $("settings").classList.add("hidden");
+    promptInstall();
+  } else if (e.target.closest("#installUnhide")) {
+    state.settings = saveSettings({ installDismissed: false });
+    refreshInstallUi();
+  }
+});
+
+refreshInstallUi();
 
 // -------- helpers
 

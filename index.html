@@ -103,12 +103,18 @@
 
     <button id="saveSettings" class="primary-btn">Save</button>
 
+    <h3>Install</h3>
+    <div id="installRow" class="install-row"></div>
+
     <h3>Where the data comes from</h3>
     <ul class="src-list" id="srcList"></ul>
   </div>
 </section>
 
-<button id="installBtn" class="install-btn hidden">⬇︎ Add to Home Screen</button>
+<div id="installBar" class="install-bar hidden">
+  <button id="installBtn" class="install-btn">⬇︎ Add to Home Screen</button>
+  <button id="installDismiss" class="install-dismiss" title="Not now — you can bring this back in Settings" aria-label="Hide install prompt">✕</button>
+</div>
 
 <script src="vendor/leaflet/leaflet.js"></script>
 <script type="module" src="app.js"></script>
