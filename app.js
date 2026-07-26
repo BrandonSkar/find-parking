@@ -174,6 +174,63 @@ function renderList() {
 
 // ----------------------------------------------------------------- markers
 
+// How far off the road centreline to draw a kerb, in metres. Roughly half a
+// carriageway, so the line lands where the parked cars actually are.
+const KERB_OFFSET_M = 5;
+
+// Shift a path sideways by `metres`, positive = left of the direction of travel.
+// Flat-earth is fine here: we're offsetting metres on a single city block, where
+// the error from ignoring curvature is far below the width of the drawn line.
+function offsetPath(pts, metres) {
+  const mPerLat = 110540;
+  const mPerLon = 111320 * Math.cos((pts[0].lat * Math.PI) / 180) || 1;
+  const xy = pts.map((p) => ({ x: p.lon * mPerLon, y: p.lat * mPerLat }));
+
+  return xy.map((p, i) => {
+    // Direction through this vertex — averages the two segments at a corner,
+    // which keeps the offset line from pinching on tight bends.
+    const a = xy[Math.max(0, i - 1)];
+    const b = xy[Math.min(xy.length - 1, i + 1)];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len = Math.hypot(dx, dy) || 1;
+    // Left-hand normal.
+    const nx = -dy / len;
+    const ny = dx / len;
+    return [(p.y + ny * metres) / mPerLat, (p.x + nx * metres) / mPerLon];
+  });
+}
+
+function drawKerb(r, color) {
+  const { spot, avail } = r;
+  const sides = spot.sides?.length ? spot.sides : ["left"];
+
+  for (const side of sides) {
+    const path = offsetPath(spot.geometry, side === "left" ? KERB_OFFSET_M : -KERB_OFFSET_M);
+
+    // A 5px line is a hard target for a thumb, so an invisible fat line takes
+    // the taps. It sits underneath, so the visible one is unaffected.
+    L.polyline(path, { color: "#000", opacity: 0, weight: 22 })
+      .addTo(layer)
+      .on("click", () => openDetail(r));
+
+    // A pale casing keeps the kerb readable against both basemaps. Confidence
+    // is carried by the colour's saturation (see scoreColor) rather than by a
+    // dash — dashing a 5px line just turns the street into a row of beads.
+    L.polyline(path, { color: "#fff", opacity: 0.5, weight: 9, lineCap: "round" }).addTo(layer);
+
+    const line = L.polyline(path, {
+      color,
+      weight: 5,
+      opacity: 0.95,
+      lineCap: "round",
+    }).addTo(layer);
+
+    line.bindTooltip(`${spotName(spot)} — ${avail.score}%`, { sticky: true });
+    line.on("click", () => openDetail(r));
+  }
+}
+
 function renderMarkers() {
   layer.clearLayers();
   state.markers.clear();
@@ -182,12 +239,19 @@ function renderMarkers() {
     const { spot, avail } = r;
     const color = scoreColor(avail.score, avail.confidence);
     const dashed = avail.confidence === "predicted";
+    const isKerb = spot.geometry && spot.geometry.length > 1;
 
+    if (isKerb) drawKerb(r, color);
+
+    // Kerbs still get a dot, at the end of the block nearest you — that's the
+    // point the walk time is measured to, and it keeps list and map in sync.
+    // It stays small and plain so it reads as a handle on the line, not as a
+    // second result sitting next to it.
     const marker = L.circleMarker([spot.lat, spot.lon], {
-      radius: 11,
-      color: dashed ? color : "#fff",
-      weight: dashed ? 2 : 2.5,
-      dashArray: dashed ? "3 3" : null,
+      radius: isKerb ? 5 : 11,
+      color: dashed && !isKerb ? color : "#fff",
+      weight: isKerb ? 1.5 : dashed ? 2 : 2.5,
+      dashArray: dashed && !isKerb ? "3 3" : null,
       fillColor: color,
       fillOpacity: 0.92,
     }).addTo(layer);
@@ -298,7 +362,8 @@ function openDetail(r) {
       <div class="facts">
         ${fact("Type", { garage: "Garage", lot: "Surface lot", street: "On-street", meter: "Metered street" }[spot.kind])}
         ${fact("Price", price || (spot.fee === false ? "Free" : spot.fee ? "Paid" : null))}
-        ${fact("Capacity", spot.capacity ? `${spot.capacity} spaces` : null)}
+        ${fact("Capacity", spot.capacity ? `${spot.capacity} spaces${spot.tags?._capacityEstimated ? " (estimated)" : ""}` : null)}
+        ${fact("Kerb", kerbFact(spot))}
         ${fact("Max stay", spot.maxStay ? `${spot.maxStay >= 60 ? spot.maxStay / 60 + " hr" : spot.maxStay + " min"}` : null)}
         ${fact("Hours", spot.hours)}
         ${fact("Access", spot.access)}
@@ -363,6 +428,16 @@ function openDetail(r) {
 
 const fact = (k, v) =>
   v ? `<div class="fact"><span>${k}</span><b>${escapeHtml(String(v))}</b></div>` : "";
+
+// Left/right is meaningless to a driver — it's relative to the way's direction,
+// which nobody can see. How much of the block is parkable is the useful part,
+// and the map already shows which side the line is on.
+function kerbFact(spot) {
+  if (!spot.geometry) return null;
+  const len = spot.tags?._kerbLengthM;
+  const sides = spot.sides?.length === 2 ? "Both sides" : "One side";
+  return len ? `${sides} · ${len} m block` : sides;
+}
 
 // Show the human name of each contributing source, not its internal id.
 function sourceLabels(spot) {

@@ -31,7 +31,9 @@ tow, not a win. Availability and legality are computed independently.
 
 - **OpenStreetMap / Overpass** — the base layer. Worldwide coverage of lots,
   garages and street parking, with capacity / fee / access / opening-hours tags.
-  Knows *where* parking is, never whether it's free right now.
+  Kerb parking comes back with the full shape of the block so it can be drawn
+  as a line (see below). Knows *where* parking is, never whether it's free
+  right now.
 - **LA LADOT live meter occupancy** — genuinely real-time on-street sensor data,
   space by space, updated continuously. Free and unauthenticated. This is the
   rare case of true measured street availability.
@@ -59,6 +61,78 @@ that returns `Spot[]`. Nothing in the UI or scoring engine needs to change.
 
 ---
 
+## Street parking is a line, not a pin
+
+A garage is a place. A block of kerb is a **stretch**, and putting one pin in
+the middle of it tells you nothing about where the parking starts or stops. So
+kerb parking is drawn as a coloured line down the side of the street it's
+actually on, using the same score colour as everything else.
+
+Getting there takes a few things that aren't obvious:
+
+- **Two queries, not one.** Lots only need a centre point; kerbs need their
+  shape. Overpass can't do both in one `out` statement, so the query splits the
+  results into two sets and asks for `center` on one and `geom` on the other.
+  Measured at 96 KB / 2.0 s for an 800 m search in downtown Portland.
+- **Ways don't stop at the block.** An arterial can run for kilometres past the
+  search area. The path is clipped to the search radius, cutting the crossing
+  segment at the boundary rather than dropping it — otherwise a road with
+  vertices only at its far ends collapses to a single point.
+- **The line is offset, not centred.** `parking:left` / `right` / `both` say
+  which kerb, so each side is drawn ~5 m off the centreline along the segment
+  normal. Both-sides streets get two lines. A line down the middle of the road
+  would just look like a highlighted road.
+- **The pin moves to the near end.** A block's distance is to its *closest*
+  point, not its midpoint, so walk times are honest and the dot sits where
+  you'd actually arrive.
+- **Nobody tags how many cars fit.** Capacity is estimated from block length ÷
+  space size, where the size comes from `parking:*:orientation` (parallel 5.5 m,
+  diagonal 3.5 m, perpendicular 2.7 m), discounted 20% for driveways and
+  corners. Blocks too short for one car are dropped as map noise.
+
+Both tagging schemas are read — the current `parking:left=lane` one and the
+older `parking:lane:left=parallel` — because both are in live use.
+
+### What a kerb's score means
+
+A block is a different question from a facility. The useful number isn't "how
+empty is this street" but "will **at least one** of these n spaces be free",
+which is much higher and grows with the length of the block. That's why
+cruising a long street works and cruising a short one doesn't.
+
+Spaces on one block don't free up independently, though — the whole street is
+busy at the same times — so the effective count is damped to `√n` and capped at
+6. A 150-space boulevard is not 150 independent coin flips.
+
+Paid on-street, weekday:
+
+| Block | 5pm peak | 3am |
+|---|---|---|
+| 2 spaces | 20% | 77% |
+| 14 spaces | 37% | 97% |
+| 36 spaces | 50% | 97% |
+| 152 spaces | 50% | 97% |
+
+The last two rows being identical is the cap doing its job: past ~36 spaces a
+longer block stops helping, because what's really limiting you is that the
+whole street is busy at once.
+
+### The honest caveat
+
+`parking:*` coverage is uneven. It's good in Germany and the Netherlands and in
+a handful of US downtowns, and absent almost everywhere else. **A street with
+no line is not a street with no parking** — it's a street nobody has mapped.
+
+Worse, the rules that actually get you towed are barely mapped at all. In a
+downtown Portland sample, 2 of 130 kerb ways carried any restriction tag, and
+*none* carried a conditional one — so there is no street-sweeping data to
+evaluate even in a well-mapped city. Until that's fixed, a kerb never shows a
+clean "you can park here"; it always carries a check-the-signs caveat. Reading
+`parking:*:restriction:conditional` and the municipal sweeping datasets (LA and
+SF both publish theirs) is the next piece of work.
+
+---
+
 ## How the estimate is built
 
 When nothing is measured, `engine.js` scores 0–100 from:
@@ -69,6 +143,8 @@ When nothing is measured, `engine.js` scores 0–100 from:
 - **Historical occupancy** where a city publishes it — this overrides the generic
   curve entirely, because real observations beat a model.
 - **Capacity** — big facilities almost always have something free (log-scaled).
+  On-street blocks skip this and use the block model above instead, which prices
+  capacity in already.
 - **Price** — paid parking scores *higher*. Price rations demand; free parking
   next door fills up first. This is counterintuitive and it's the single most
   useful signal in the model.

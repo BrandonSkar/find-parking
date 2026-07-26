@@ -130,6 +130,14 @@ export function checkLegality(spot, now = new Date()) {
   if (spot.maxStay && spot.maxStay <= 30)
     warnings.push(`${spot.maxStay} min max stay`);
 
+  // On-street rules — sweeping windows, permit hours, loading zones — are the
+  // ones that actually get you towed, and OSM barely carries them: in a
+  // downtown Portland sample, 2 of 130 kerb ways had any restriction tag at
+  // all, and none had a conditional one. Until those are evaluated properly, a
+  // kerb never shows a clean "you can park here" — we can't support the claim.
+  // Pushed last so a specific warning still wins the one-line slot in the list.
+  if (spot.geometry) warnings.push("Kerb rules aren't mapped — check posted signs");
+
   return {
     ok: blockers.length === 0,
     unknown: hrs === null && !spot.hours ? false : hrs === null,
@@ -236,16 +244,44 @@ export function scoreSpot(spot, now = new Date()) {
   return predictScore(spot, now);
 }
 
+// A block of kerb is a different question from a facility. We know roughly how
+// many spaces are on it, so the useful number isn't "how empty is this street"
+// but "will AT LEAST ONE of those n spaces be free" — which is much higher, and
+// grows with the length of the block. That's why cruising a long street works.
+//
+// Spaces on one block don't free up independently (the whole street is busy at
+// the same times), so the effective count is damped to sqrt(n) and capped:
+// a 150-space boulevard is not 150 independent coin flips.
+function blockAvailability(capacity, demand) {
+  const occupancy = clamp(0.35 + demand * 0.6, 0, 0.97);
+  const effective = clamp(Math.sqrt(capacity), 1, 6);
+  return 1 - Math.pow(occupancy, effective);
+}
+
 function predictScore(spot, now) {
   const reasons = [];
   let score = BASE_BY_KIND[spot.kind] ?? 55;
 
   // Observed historical occupancy for this hour beats any generic curve.
   const hist = spot.tags?._histFreeRatio;
+  const isBlock = !!spot.geometry && !!spot.capacity && typeof hist !== "number";
+
   if (typeof hist === "number") {
     score = Math.round(hist * 110);
     reasons.push(
       `Historically ~${Math.round(hist * 100)}% open at this hour`
+    );
+  } else if (isBlock) {
+    // A kerb of known length — score the block, not the average space.
+    const demand = demandAt(now);
+    score = Math.round(blockAvailability(spot.capacity, demand) * 92);
+    reasons.push(
+      `~${spot.capacity} spaces along this block` +
+        (demand > 0.75
+          ? ", but it's peak hours"
+          : demand > 0.45
+          ? ", moderate demand right now"
+          : ", and demand is low")
     );
   } else {
     const demand = demandAt(now);
@@ -261,10 +297,10 @@ function predictScore(spot, now) {
     );
   }
 
-  // Bigger facilities almost always have something free.
-  if (spot.capacity) {
-    const bonus = clamp(Math.log10(spot.capacity) * 7, 0, 16);
-    score += bonus;
+  // Bigger facilities almost always have something free. Skipped for kerbs,
+  // where the block model above has already priced capacity in.
+  if (spot.capacity && !isBlock) {
+    score += clamp(Math.log10(spot.capacity) * 7, 0, 16);
     if (spot.capacity >= 100) reasons.push(`Large facility (${spot.capacity} spaces)`);
   }
 

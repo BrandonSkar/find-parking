@@ -36,6 +36,11 @@ export function makeSpot(o) {
     lat: o.lat,
     lon: o.lon,
     kind: o.kind || "lot", // garage | lot | street | meter
+    // Kerb parking is a LINE, not a point. When we know the shape of the block
+    // we keep it so the map can draw the actual stretch of kerb; lat/lon then
+    // holds the point on it nearest the searcher, which is where they'd walk to.
+    geometry: o.geometry ?? null, // [{lat,lon}, …] along the street
+    sides: o.sides ?? null, // ["left"] | ["right"] | ["left","right"]
     capacity: o.capacity ?? null, // total spaces, if known
     fee: o.fee ?? null, // true | false | null(unknown)
     access: o.access ?? null, // yes | private | customers | permit
@@ -124,6 +129,74 @@ export function distanceMeters(a, b) {
   return 2 * R * Math.asin(Math.sqrt(h));
 }
 
+function pathLengthMeters(pts) {
+  let m = 0;
+  for (let i = 1; i < pts.length; i++) m += distanceMeters(pts[i - 1], pts[i]);
+  return m;
+}
+
+// A block of kerb isn't "at" one place. The distance that matters is to the
+// closest end of it, so that's the point we hang the spot on.
+function nearestVertexIndex(pts, center) {
+  let best = 0;
+  let bestD = Infinity;
+  pts.forEach((p, i) => {
+    const d = distanceMeters(center, p);
+    if (d < bestD) {
+      bestD = d;
+      best = i;
+    }
+  });
+  return best;
+}
+
+// Walk from an in-range point towards an out-of-range one and stop at the edge.
+// Bisection rather than algebra because the edge is defined by the same
+// great-circle distance used everywhere else, and 12 halvings lands well inside
+// a metre at city scale.
+function boundaryPoint(inP, outP, center, maxM) {
+  let lo = 0;
+  let hi = 1;
+  for (let k = 0; k < 12; k++) {
+    const mid = (lo + hi) / 2;
+    const p = {
+      lat: inP.lat + (outP.lat - inP.lat) * mid,
+      lon: inP.lon + (outP.lon - inP.lon) * mid,
+    };
+    if (distanceMeters(center, p) <= maxM) lo = mid;
+    else hi = mid;
+  }
+  return {
+    lat: inP.lat + (outP.lat - inP.lat) * lo,
+    lon: inP.lon + (outP.lon - inP.lon) * lo,
+  };
+}
+
+// OSM ways don't stop at the block — an arterial can run for kilometres. Keep
+// only the stretch around the nearest point that's actually within reach, so
+// the map doesn't sprout lines shooting off to the horizon and the capacity
+// estimate describes the bit you'd really walk to.
+// Returns null when no part of the way is in range.
+function clipPath(pts, center, maxM) {
+  const inside = (p) => distanceMeters(center, p) <= maxM;
+  const i = nearestVertexIndex(pts, center);
+  if (!inside(pts[i])) return null;
+
+  let a = i;
+  let b = i;
+  while (a > 0 && inside(pts[a - 1])) a--;
+  while (b < pts.length - 1 && inside(pts[b + 1])) b++;
+
+  // Ways are often drawn with vertices only at their ends, so a long road
+  // crossing the search area can have just one vertex inside it. Cutting the
+  // crossing segment at the boundary keeps that as a line rather than a dot.
+  const cut = pts.slice(a, b + 1);
+  if (a > 0) cut.unshift(boundaryPoint(pts[a], pts[a - 1], center, maxM));
+  if (b < pts.length - 1) cut.push(boundaryPoint(pts[b], pts[b + 1], center, maxM));
+
+  return cut.length >= 2 ? cut : null;
+}
+
 function bbox(center, radiusM) {
   const dLat = radiusM / 111320;
   const dLon = radiusM / (111320 * Math.cos((center.lat * Math.PI) / 180) || 1);
@@ -133,6 +206,92 @@ function bbox(center, radiusM) {
     north: center.lat + dLat,
     east: center.lon + dLon,
   };
+}
+
+// ------------------------------------------------------- on-street kerb tags
+//
+// OSM has two schemas for "can you park along this road", and both are in
+// active use, so we read both:
+//
+//   current:  parking:left=lane        parking:left:orientation=parallel
+//             parking:both:fee=yes     parking:right:restriction=no_parking
+//   older:    parking:lane:left=parallel   parking:condition:left=ticket
+//
+// Values that mean "no kerb parking here". `separate` means the parking is
+// mapped as its own feature, so counting the road too would double-count it.
+const NO_KERB = new Set([
+  "no",
+  "none",
+  "separate",
+  "no_parking",
+  "no_stopping",
+  "no_standing",
+  "fire_lane",
+]);
+
+// Rough metres of kerb consumed per car, by how the cars sit against it.
+const SPACE_LEN_M = { parallel: 5.5, diagonal: 3.5, perpendicular: 2.7 };
+
+// Which side(s) of this way you can actually park on. An explicit left/right
+// tag beats a `both`, and the current schema beats the older one.
+export function kerbSides(t) {
+  const on = { left: null, right: null };
+  const set = (side, v) => {
+    if (v != null) on[side] = !NO_KERB.has(v);
+  };
+
+  for (const prefix of ["parking:lane", "parking"]) {
+    const both = t[`${prefix}:both`];
+    if (both != null) {
+      set("left", both);
+      set("right", both);
+    }
+    set("left", t[`${prefix}:left`]);
+    set("right", t[`${prefix}:right`]);
+  }
+
+  // An unconditional restriction removes that side. Conditional ones (street
+  // sweeping windows and the like) are left alone — those are a legality
+  // question, and pretending the kerb doesn't exist is the wrong answer.
+  for (const side of ["left", "right"]) {
+    for (const key of [`parking:${side}:restriction`, "parking:both:restriction"]) {
+      const v = t[key];
+      if (v && NO_KERB.has(v) && !t[`${key}:conditional`]) on[side] = false;
+    }
+  }
+
+  return ["left", "right"].filter((s) => on[s] === true);
+}
+
+// Read a per-side tag, preferring the specific side over `both`.
+function sideTag(t, sides, suffix) {
+  for (const side of [...sides, "both"]) {
+    const v = t[`parking:${side}:${suffix}`];
+    if (v != null) return v;
+  }
+  return null;
+}
+
+function kerbOrientation(t, side) {
+  const candidates = [
+    t[`parking:${side}:orientation`],
+    t["parking:both:orientation"],
+    t[`parking:lane:${side}`], // older schema puts orientation in the value
+    t["parking:lane:both"],
+  ];
+  for (const v of candidates) if (v && SPACE_LEN_M[v]) return v;
+  return "parallel";
+}
+
+// Nobody tags how many cars fit on a block, but the block has a length and
+// cars have a size. Discounted for driveways, corners and hydrants, which eat
+// a surprising amount of any real street.
+function estimateKerbCapacity(t, sides, lengthM) {
+  let n = 0;
+  for (const side of sides) {
+    n += Math.floor((lengthM * 0.8) / SPACE_LEN_M[kerbOrientation(t, side)]);
+  }
+  return n > 0 ? n : null;
 }
 
 // =============================================================================
@@ -150,43 +309,90 @@ const osmSource = {
   async fetch({ center, radiusM }) {
     const b = bbox(center, radiusM);
     const box = `${b.south},${b.west},${b.north},${b.east}`;
-    // Lots/garages, plus street-side parking mapped with the newer
-    // parking:both/left/right street schema.
+    // Two sets, because they want different geometry back. Lots and garages
+    // are places, so a centre point is enough. Kerb parking is a stretch of
+    // road, so we ask for the full shape (`out geom`) and draw it as a line.
     const q = `[out:json][timeout:25];
+nwr["amenity"="parking"](${box})->.lots;
 (
-  nwr["amenity"="parking"](${box});
   way["parking:both"](${box});
   way["parking:left"](${box});
   way["parking:right"](${box});
-);
-out center tags 400;`;
+  way["parking:lane:both"](${box});
+  way["parking:lane:left"](${box});
+  way["parking:lane:right"](${box});
+)->.streets;
+.lots out tags center 300;
+.streets out geom 200;`;
 
     const data = await overpass(q);
     const spots = [];
 
     for (const el of data.elements || []) {
       const t = el.tags || {};
+
+      // A road with kerb tags, returned with its full shape.
+      const geometry = Array.isArray(el.geometry)
+        ? el.geometry.filter((p) => p && Number.isFinite(p.lat) && Number.isFinite(p.lon))
+        : null;
+      const isKerb = !t.amenity && geometry && geometry.length >= 2;
+
+      if (isKerb) {
+        const sides = kerbSides(t);
+        if (!sides.length) continue; // tagged, but explicitly no parking
+
+        const path = clipPath(geometry, center, radiusM);
+        if (!path) continue;
+
+        const anchor = path[nearestVertexIndex(path, center)];
+        const lengthM = pathLengthMeters(path);
+        const capacity = num(t.capacity) ?? estimateKerbCapacity(t, sides, lengthM);
+        // Kerb stubs too short to hold a single car are map noise, not parking.
+        if (capacity == null) continue;
+
+        const feeTag = sideTag(t, sides, "fee");
+        const condition =
+          t[`parking:condition:${sides[0]}`] || t["parking:condition:both"];
+        const fee =
+          feeTag === "yes" || condition === "ticket"
+            ? true
+            : feeTag === "no" || condition === "free"
+            ? false
+            : null;
+
+        spots.push(
+          makeSpot({
+            id: `osm:${el.type}/${el.id}`,
+            source: "osm",
+            name: t.name || null,
+            lat: anchor.lat,
+            lon: anchor.lon,
+            kind: "street",
+            geometry: path,
+            sides,
+            capacity,
+            fee,
+            access:
+              sideTag(t, sides, "access") ||
+              (condition === "residents" ? "permit" : null),
+            maxStay: parseMaxStay(sideTag(t, sides, "maxstay")),
+            rate: parseRateRange(sideTag(t, sides, "charge")),
+            tags: {
+              ...t,
+              _kerbLengthM: Math.round(lengthM),
+              _capacityEstimated: num(t.capacity) == null,
+            },
+          })
+        );
+        continue;
+      }
+
       const lat = el.lat ?? el.center?.lat;
       const lon = el.lon ?? el.center?.lon;
       if (lat == null || lon == null) continue;
 
-      const isStreet =
-        !t.amenity &&
-        (t["parking:both"] || t["parking:left"] || t["parking:right"]);
-
-      // Skip street segments where parking is explicitly absent.
-      if (isStreet) {
-        const vals = [
-          t["parking:both"],
-          t["parking:left"],
-          t["parking:right"],
-        ].filter(Boolean);
-        if (vals.every((v) => v === "no" || v === "separate")) continue;
-      }
-
       let kind = "lot";
-      if (isStreet) kind = "street";
-      else if (t.parking === "underground" || t.parking === "multi-storey")
+      if (t.parking === "underground" || t.parking === "multi-storey")
         kind = "garage";
       else if (t.parking === "street_side" || t.parking === "lane")
         kind = "street";
@@ -195,7 +401,7 @@ out center tags 400;`;
         makeSpot({
           id: `osm:${el.type}/${el.id}`,
           source: "osm",
-          name: t.name || (isStreet ? t["name"] || "Street parking" : null),
+          name: t.name || null,
           lat,
           lon,
           kind,
@@ -625,9 +831,14 @@ function dedupe(spots) {
 
   const out = [];
   for (const sp of spots.sort((a, b) => tierOf(b) - tierOf(a))) {
-    const near = out.find(
-      (o) => o.kind === sp.kind && distanceMeters(o, sp) < 35
-    );
+    // Linear kerb features are whole blocks, not points — two of them 30 m
+    // apart are two different blocks, and collapsing them loses a real stretch
+    // of street. Only point features get merged by proximity.
+    const near = sp.geometry
+      ? null
+      : out.find(
+          (o) => !o.geometry && o.kind === sp.kind && distanceMeters(o, sp) < 35
+        );
     if (!near) {
       out.push({ ...sp, mergedFrom: [sp.source] });
       continue;
