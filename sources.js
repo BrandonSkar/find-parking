@@ -49,6 +49,12 @@ export function makeSpot(o) {
     rate: o.rate ?? null, // { min, max, currency }
     hours: o.hours ?? null, // OSM opening_hours string
     live: o.live ?? null, // { free, total, at:Date } — MEASURED
+    // Timed rules that make an otherwise-free space illegal: sweeping windows,
+    // tow-away lanes, permit hours. Separate from availability on purpose.
+    restrictions: o.restrictions ?? [],
+    // True once a source that actually covers this block has been consulted, so
+    // "no restrictions" can be told apart from "nobody looked".
+    restrictionsChecked: o.restrictionsChecked ?? false,
     tags: o.tags || {},
   };
 }
@@ -332,6 +338,69 @@ function kerbOrientation(t, side) {
   return "parallel";
 }
 
+// OSM's conditional syntax: "no_parking @ (Tu 08:00-10:00); no_stopping @ (Sa)".
+// Returns the value/condition pairs; the engine decides what the clock says.
+function parseConditionalTag(v) {
+  const out = [];
+  for (const part of String(v || "").split(";")) {
+    const m = part.match(/^\s*([^@]+?)\s*@\s*\(?([^)]+?)\)?\s*$/);
+    if (m) out.push({ value: m[1].trim(), spec: m[2].trim() });
+  }
+  return out;
+}
+
+const RESTRICTION_LABEL = {
+  no_parking: "No parking",
+  no_stopping: "No stopping",
+  no_standing: "No standing",
+  free: "Free parking",
+  ticket: "Paid parking",
+  residents: "Residents only",
+  disc: "Parking disc required",
+};
+
+// Timed kerb rules from OSM tags. Conditional restrictions are the real prize —
+// "no_parking @ (Tu 08:00-10:00)" IS a street sweeping window — but conditional
+// maxstay and fee windows matter too.
+function kerbRestrictions(t, sides) {
+  const out = [];
+  const seen = new Set();
+
+  // `blocks` is the difference between "you may not park here" and "you may,
+  // with a condition". A 2 h max stay does NOT make a space illegal, and
+  // treating it as a blocker would drop perfectly good spots off the list.
+  const add = (label, spec, kind, blocks) => {
+    const key = `${label}|${spec}`;
+    if (spec && !seen.has(key)) {
+      seen.add(key);
+      out.push({ kind, label, spec, blocks, source: "osm" });
+    }
+  };
+
+  // Both kerbs are read regardless of which side has parking: a rule tagged on
+  // the left of a way we matched on the right is still a rule on that block,
+  // and the sides are not reliably distinguishable anyway.
+  for (const side of ["left", "right", "both"]) {
+    for (const { value, spec } of parseConditionalTag(t[`parking:${side}:restriction:conditional`])) {
+      // Only prohibitions matter here; "free @ (Su)" is not a restriction.
+      if (/^no_/.test(value)) add(RESTRICTION_LABEL[value] || "No parking", spec, value, true);
+    }
+    for (const { value, spec } of parseConditionalTag(t[`parking:${side}:maxstay:conditional`])) {
+      add(`${value} max stay`, spec, "maxstay", false);
+    }
+    for (const { value, spec } of parseConditionalTag(t[`parking:${side}:fee:conditional`])) {
+      if (value === "yes") add("Paid parking", spec, "fee", false);
+    }
+    // Older schema puts the window in a sibling tag rather than inline.
+    const cond = t[`parking:condition:${side}`];
+    const interval = t[`parking:condition:${side}:time_interval`];
+    if (cond && interval && RESTRICTION_LABEL[cond]) {
+      add(RESTRICTION_LABEL[cond], interval, cond, cond === "residents");
+    }
+  }
+  return out;
+}
+
 // Nobody tags how many cars fit on a block, but the block has a length and
 // cars have a size. Discounted for driveways, corners and hydrants, which eat
 // a surprising amount of any real street.
@@ -402,6 +471,9 @@ nwr["amenity"="parking"](${box})->.lots;
         const feeTag = sideTag(t, sides, "fee");
         const condition =
           t[`parking:condition:${sides[0]}`] || t["parking:condition:both"];
+        const conditionInterval =
+          t[`parking:condition:${sides[0]}:time_interval`] ||
+          t["parking:condition:both:time_interval"];
         const fee =
           feeTag === "yes" || condition === "ticket"
             ? true
@@ -421,11 +493,16 @@ nwr["amenity"="parking"](${box})->.lots;
             sides,
             capacity,
             fee,
+            // "residents" only becomes a flat permit zone when it applies at
+            // all times. With a time_interval it's a timed rule instead — and
+            // setting both would block the block around the clock, throwing
+            // away every hour it's legal to park there.
             access:
               sideTag(t, sides, "access") ||
-              (condition === "residents" ? "permit" : null),
+              (condition === "residents" && !conditionInterval ? "permit" : null),
             maxStay: parseMaxStay(sideTag(t, sides, "maxstay")),
             rate: parseRateRange(sideTag(t, sides, "charge")),
+            restrictions: kerbRestrictions(t, sides),
             tags: {
               ...t,
               _kerbLengthM: Math.round(lengthM),
@@ -817,6 +894,200 @@ const inrixSource = {
 };
 
 // =============================================================================
+// Restriction overlays.
+//
+// These are NOT parking sources — they don't tell you where to park, they tell
+// you when a place you could park becomes a tow. So they're fetched separately
+// and attached to whatever blocks they cover, rather than returning Spot[].
+//
+// This is the piece that closes the gap the app has been warning about: OSM
+// carries almost no sweeping data (2 of 130 kerbs in a Portland sample), but
+// cities publish it directly, per blockface, with geometry.
+// =============================================================================
+
+const SF_BOUNDS = { south: 37.70, west: -122.52, north: 37.84, east: -122.35 };
+const SF_SWEEPING = "https://data.sfgov.org/resource/yhqp-riqs.json";
+
+// The feed abbreviates inconsistently ("Tues", "Thu", "Thurs"), so accept all.
+const SF_DAY = {
+  sun: 0, sunday: 0,
+  mon: 1, monday: 1,
+  tue: 2, tues: 2, tuesday: 2,
+  wed: 3, weds: 3, wednesday: 3,
+  thu: 4, thur: 4, thurs: 4, thursday: 4,
+  fri: 5, friday: 5,
+  sat: 6, saturday: 6,
+};
+
+const sfSweepingSource = {
+  id: "sfsweep",
+  label: "SF street sweeping",
+  attribution: "City and County of San Francisco open data",
+
+  covers({ center }) {
+    return (
+      center.lat >= SF_BOUNDS.south &&
+      center.lat <= SF_BOUNDS.north &&
+      center.lon >= SF_BOUNDS.west &&
+      center.lon <= SF_BOUNDS.east
+    );
+  },
+
+  // 38k rows city-wide, but the geometry column is indexed, so within_circle
+  // does the filtering server-side and comes back in well under a second.
+  async fetch({ center, radiusM }) {
+    const where = `within_circle(line,${center.lat},${center.lon},${Math.round(radiusM * 1.3)})`;
+    const rows = await fetchJSON(
+      `${SF_SWEEPING}?$where=${encodeURIComponent(where)}&$limit=2000`,
+      {},
+      15000
+    );
+
+    const out = [];
+    for (const r of rows) {
+      const dow = SF_DAY[String(r.weekday || "").toLowerCase()];
+      const fromHour = num(r.fromhour);
+      const toHour = num(r.tohour);
+      const coords = r.line?.coordinates;
+      if (dow == null || fromHour == null || !Array.isArray(coords)) continue;
+
+      // week1..week5 flag which occurrences in the month this route runs, which
+      // is how "2nd and 4th Tuesday" signs are encoded.
+      const weeks = [1, 2, 3, 4, 5].filter((w) => r[`week${w}`] === "1");
+
+      out.push({
+        kind: "sweeping",
+        label: "Street sweeping",
+        blocks: true,
+        source: "sfsweep",
+        schedule: { days: [dow], fromHour, toHour: toHour ?? fromHour + 1, weeks },
+        side: r.blockside || null,
+        where: [r.corridor, r.limits].filter(Boolean).join(" "),
+        // GeoJSON is [lon,lat]; everything else here is {lat,lon}.
+        geometry: coords.map(([lon, lat]) => ({ lat, lon })),
+      });
+    }
+    return out;
+  },
+};
+
+export const RESTRICTION_SOURCES = [sfSweepingSource];
+
+function bearingDeg(a, b) {
+  const y =
+    (b.lon - a.lon) * Math.cos((((a.lat + b.lat) / 2) * Math.PI) / 180);
+  const x = b.lat - a.lat;
+  return (Math.atan2(y, x) * 180) / Math.PI;
+}
+
+// Smallest angle between two *undirected* lines, 0..90. Which way each was
+// drawn is arbitrary, so a 180° flip is the same street.
+function angleBetween(b1, b2) {
+  const d = Math.abs(b1 - b2) % 180;
+  return d > 90 ? 180 - d : d;
+}
+
+const RESTRICTION_MATCH_M = 22;
+const RESTRICTION_MATCH_DEG = 25;
+
+// Does this sweeping route run ALONG this block, rather than merely touching it?
+//
+// Proximity alone is not enough, and getting this wrong is not subtle: every
+// cross street comes within a few metres at the intersection, so a plain
+// distance test hung 51 rules on one block of O'Farrell St, most of them
+// belonging to Stockton St. Requiring the two to be roughly parallel throws the
+// cross streets out, because they meet at right angles.
+function runsAlong(kerb, sweep, maxM) {
+  // A spot with no shape (a meter point) has no bearing to compare — fall back
+  // to proximity and accept that it's the looser test.
+  if (kerb.length < 2) {
+    return sweep.some((q) => distanceMeters(kerb[0], q) <= maxM);
+  }
+
+  const sweepBearing = bearingDeg(sweep[0], sweep[sweep.length - 1]);
+  for (let i = 0; i < kerb.length - 1; i++) {
+    if (angleBetween(bearingDeg(kerb[i], kerb[i + 1]), sweepBearing) > RESTRICTION_MATCH_DEG)
+      continue;
+    for (const q of sweep) {
+      if (distanceMeters(kerb[i], q) <= maxM || distanceMeters(kerb[i + 1], q) <= maxM)
+        return true;
+    }
+  }
+  return false;
+}
+
+// Adjacent sub-blocks repeat the same schedule, so collapse identical rules —
+// a driver needs "swept Friday 2-6am", not the same line nineteen times.
+function restrictionKey(r) {
+  const s = r.schedule;
+  return s
+    ? `${r.label}|${(s.days || []).join("")}|${s.fromHour}|${s.toHour}|${(s.weeks || []).join("")}`
+    : `${r.label}|${r.spec}`;
+}
+
+// Downtown blocks swept at the same hour every day arrive as seven separate
+// rows, one per weekday. Fold rules that differ ONLY in weekday into one, so
+// the sheet reads "Every day 02:00-06:00" instead of a wall of near-duplicates.
+//
+// Copies before merging: these records are shared across every block they
+// match, so mutating one would corrupt the others.
+function mergeByDay(list) {
+  const out = [];
+  const byShape = new Map();
+
+  for (const r of list) {
+    if (!r.schedule) {
+      out.push(r);
+      continue;
+    }
+    const s = r.schedule;
+    const shape = `${r.label}|${s.fromHour}|${s.toHour}|${(s.weeks || []).join("")}`;
+    const hit = byShape.get(shape);
+    if (hit) {
+      for (const d of s.days) {
+        if (!hit.schedule.days.includes(d)) hit.schedule.days.push(d);
+      }
+      // The merged days can come from different sub-blocks; rather than pick
+      // one arbitrarily and imply precision we don't have, drop the location.
+      if (hit.where !== r.where) hit.where = null;
+      continue;
+    }
+    const copy = { ...r, schedule: { ...s, days: [...s.days] } };
+    byShape.set(shape, copy);
+    out.push(copy);
+  }
+
+  for (const r of out) r.schedule?.days.sort((a, b) => a - b);
+  return out;
+}
+
+// Attach each restriction to the blocks it covers. Deliberately side-agnostic:
+// the feed's left/right is relative to the city's centreline direction and OSM's
+// is relative to the way's, and they do not reliably agree — so a rule found on
+// a block is reported for that block. Over-warning about the far kerb is a
+// nuisance; under-warning about yours is a tow.
+function applyRestrictions(spots, restrictions) {
+  for (const spot of spots) {
+    if (spot.kind !== "street" && spot.kind !== "meter") continue;
+    spot.restrictionsChecked = true;
+
+    const path = spot.geometry || [{ lat: spot.lat, lon: spot.lon }];
+    const found = [...spot.restrictions];
+    const seen = new Set(found.map(restrictionKey));
+
+    for (const r of restrictions) {
+      const key = restrictionKey(r);
+      if (seen.has(key)) continue;
+      if (runsAlong(path, r.geometry, RESTRICTION_MATCH_M)) {
+        seen.add(key);
+        found.push(r);
+      }
+    }
+    spot.restrictions = mergeByDay(found);
+  }
+}
+
+// =============================================================================
 // Registry + orchestration
 // =============================================================================
 
@@ -842,21 +1113,27 @@ export async function findParking({ center, radiusM = 800, keys = {} }) {
     return true;
   });
 
-  const settled = await Promise.allSettled(
-    active.map((s) => s.fetch({ center, radiusM, key: keys[s.keyName] }))
+  // Restriction feeds run alongside the parking sources, not after them —
+  // they're independent, and serialising would double the wait.
+  const activeRestrictions = RESTRICTION_SOURCES.filter(
+    (s) => !s.covers || s.covers({ center })
   );
 
+  const settled = await Promise.allSettled([
+    ...active.map((s) => s.fetch({ center, radiusM, key: keys[s.keyName] })),
+    ...activeRestrictions.map((s) => s.fetch({ center, radiusM })),
+  ]);
+
   const spots = [];
+  const restrictions = [];
   const reports = [];
+  let restrictionsOk = false;
+
   settled.forEach((res, i) => {
-    const s = active[i];
-    if (res.status === "fulfilled") {
-      const near = res.value.filter(
-        (sp) => distanceMeters(center, sp) <= radiusM * 1.15
-      );
-      spots.push(...near);
-      reports.push({ source: s.id, label: s.label, ok: true, count: near.length });
-    } else {
+    const isSpotSource = i < active.length;
+    const s = isSpotSource ? active[i] : activeRestrictions[i - active.length];
+
+    if (res.status === "rejected") {
       reports.push({
         source: s.id,
         label: s.label,
@@ -864,10 +1141,35 @@ export async function findParking({ center, radiusM = 800, keys = {} }) {
         count: 0,
         error: res.reason?.message || String(res.reason),
       });
+      return;
+    }
+
+    if (isSpotSource) {
+      const near = res.value.filter(
+        (sp) => distanceMeters(center, sp) <= radiusM * 1.15
+      );
+      spots.push(...near);
+      reports.push({ source: s.id, label: s.label, ok: true, count: near.length });
+    } else {
+      restrictions.push(...res.value);
+      restrictionsOk = true;
+      reports.push({
+        source: s.id,
+        label: s.label,
+        ok: true,
+        count: res.value.length,
+        restriction: true,
+      });
     }
   });
 
-  return { spots: dedupe(spots), reports };
+  const merged = dedupe(spots);
+  // Only mark blocks as checked when a covering feed actually answered. A feed
+  // that failed must not turn "we don't know" into a silent all-clear — but a
+  // feed that answered with nothing nearby genuinely means nothing is scheduled.
+  if (restrictionsOk) applyRestrictions(merged, restrictions);
+
+  return { spots: merged, reports };
 }
 
 // Sources overlap — a garage can appear in OSM, Google and SpotHero at once.

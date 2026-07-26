@@ -1,7 +1,7 @@
 // app.js — UI wiring: map, search, list, detail, crowd reporting, PWA install.
 
 import { findParking, geocode, distanceMeters, SOURCES } from "./sources.js";
-import { rankSpots, demandAt } from "./engine.js";
+import { rankSpots, demandAt, describeSweep, nextSweep, windowStatus } from "./engine.js";
 import {
   getSettings,
   saveSettings,
@@ -354,6 +354,8 @@ function openDetail(r) {
           : `<div class="banner good">✅ You can park here right now</div>`
       }
 
+      ${restrictionsHtml(spot)}
+
       <h3>Why this score</h3>
       <ul class="reasons">
         ${avail.reasons.map((x) => `<li>${escapeHtml(x)}</li>`).join("")}
@@ -429,6 +431,60 @@ function openDetail(r) {
 const fact = (k, v) =>
   v ? `<div class="fact"><span>${k}</span><b>${escapeHtml(String(v))}</b></div>` : "";
 
+// The timed rules, spelled out. This is the section that stops you getting
+// towed, so it shows the whole schedule rather than only what's imminent — and
+// says plainly when nothing covers the block, because silence from a source
+// that was never consulted is not an all-clear.
+function restrictionsHtml(spot) {
+  const isKerb = spot.kind === "street" || spot.kind === "meter";
+  if (!isKerb) return "";
+
+  const now = new Date();
+  const status = (r) =>
+    r.schedule ? nextSweep(r.schedule, now) : windowStatus(r.spec, now);
+
+  // Soonest first — the rule that's about to bite is the one worth reading.
+  const ordered = [...(spot.restrictions || [])].sort((a, b) => {
+    const rank = (r) => {
+      const s = status(r);
+      if (!s) return Infinity;
+      return s.active ? -1 : s.startsInMin ?? Infinity;
+    };
+    return rank(a) - rank(b);
+  });
+
+  const rows = ordered.map((r) => {
+    const when = r.schedule ? describeSweep(r.schedule) : r.spec;
+    const s = status(r);
+    const next = !s
+      ? ""
+      : s.active
+      ? `<em class="now">happening now</em>`
+      : s.startsInMin != null
+      ? `<em>next ${nextWords(s.startsInMin)}</em>`
+      : "";
+    return `<li><b>${escapeHtml(r.label)}</b> ${escapeHtml(when)} ${next}
+      ${r.where ? `<span class="dim">${escapeHtml(r.where)}</span>` : ""}</li>`;
+  });
+
+  if (!rows.length) {
+    return `<h3>Timed restrictions</h3><p class="hint">${
+      spot.restrictionsChecked
+        ? "✅ No street sweeping or timed restriction scheduled for this block."
+        : "⚠︎ No schedule data covers this block — the posted sign is the only authority."
+    }</p>`;
+  }
+  return `<h3>Timed restrictions</h3><ul class="restrictions">${rows.join("")}</ul>`;
+}
+
+// "in 40 min" reads oddly for something two days out.
+function nextWords(mins) {
+  if (mins < 60) return `in ${mins} min`;
+  if (mins < 1440) return `in ${Math.floor(mins / 60)} hr`;
+  const d = Math.round(mins / 1440);
+  return `in ${d} day${d === 1 ? "" : "s"}`;
+}
+
 // Left/right is meaningless to a driver — it's relative to the way's direction,
 // which nobody can see. How much of the block is parkable is the useful part,
 // and the map already shows which side the line is on.
@@ -454,7 +510,9 @@ const closeDetail = () => $("detail").classList.add("hidden");
 function renderSourceNote() {
   const ok = state.reports.filter((r) => r.ok);
   const bad = state.reports.filter((r) => !r.ok);
-  const parts = ok.map((r) => `${r.label}: ${r.count}`);
+  // Restriction feeds return rules, not places — labelling both as a bare
+  // count makes 1,894 sweeping records look like 1,894 parking spaces.
+  const parts = ok.map((r) => `${r.label}: ${r.count}${r.restriction ? " rules" : ""}`);
   $("sourceNote").innerHTML =
     `<b>Sources:</b> ${parts.join(" · ") || "none"}` +
     (bad.length ? `<br><span class="err">Unavailable: ${bad.map((b) => b.label).join(", ")}</span>` : "");

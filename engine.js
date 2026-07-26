@@ -106,6 +106,149 @@ function dayMatches(dayPart, dow) {
 const cap = (x) => x[0].toUpperCase() + x.slice(1, 2).toLowerCase();
 
 // =============================================================================
+// Time windows — "when does this rule bite, and how long have I got?"
+//
+// evaluateHours above answers "is it open"; a restriction needs more than that.
+// Parking at 07:30 on a street swept 08:00-10:00 is legal *right now* and still
+// a tow, so what matters is how many minutes until the window opens.
+// =============================================================================
+
+const ALL_DAYS = [0, 1, 2, 3, 4, 5, 6];
+
+// "Mo-Fr 07:00-09:00,16:00-18:00" -> [{days,start,end}, …]. A rule with no
+// times ("Sa,Su") covers the whole day. Minutes from midnight; `end` may run
+// past 1440 for a window that crosses midnight.
+function parseSpans(spec) {
+  const spans = [];
+  for (const rule of String(spec).split(";")) {
+    const r = rule.trim();
+    if (!r) continue;
+
+    const times = [...r.matchAll(/(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})/g)];
+    const dayPart = r
+      .slice(0, times.length ? times[0].index : r.length)
+      .trim()
+      .replace(/,$/, "");
+
+    const days = dayPart ? ALL_DAYS.filter((d) => dayMatches(dayPart, d)) : ALL_DAYS;
+    if (!days.length) continue;
+
+    if (!times.length) {
+      spans.push({ days, start: 0, end: 1440 });
+      continue;
+    }
+    for (const t of times) {
+      const start = +t[1] * 60 + +t[2];
+      let end = +t[3] * 60 + +t[4];
+      if (end <= start) end += 1440; // crosses midnight
+      spans.push({ days, start, end });
+    }
+  }
+  return spans.length ? spans : null;
+}
+
+/**
+ * Where are we relative to this window right now?
+ * @returns {{active:boolean, endsInMin:number|null, startsInMin:number|null}|null}
+ *          null when the spec can't be parsed — never a confident "you're fine".
+ */
+export function windowStatus(spec, now = new Date()) {
+  const spans = parseSpans(spec);
+  if (!spans) return null;
+
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+  const dow = now.getDay();
+
+  let endsInMin = null;
+  let startsInMin = Infinity;
+
+  // Start at -1: a window that opened yesterday evening can still be running.
+  for (let off = -1; off <= 7; off++) {
+    const day = (((dow + off) % 7) + 7) % 7;
+    for (const s of spans) {
+      if (!s.days.includes(day)) continue;
+      const start = off * 1440 + s.start;
+      const end = off * 1440 + s.end;
+      if (nowMin >= start && nowMin < end) {
+        endsInMin = Math.min(endsInMin ?? Infinity, end - nowMin);
+      } else if (start > nowMin) {
+        startsInMin = Math.min(startsInMin, start - nowMin);
+      }
+    }
+  }
+
+  return {
+    active: endsInMin != null,
+    endsInMin: endsInMin == null ? null : Math.round(endsInMin),
+    startsInMin: Number.isFinite(startsInMin) ? Math.round(startsInMin) : null,
+  };
+}
+
+// A schedule that repeats on given weekdays, optionally only in certain weeks
+// of the month — how municipal street sweeping is almost always published, and
+// something opening_hours syntax can't express, so it gets its own walk forward
+// through the calendar.
+export function nextSweep(sched, now = new Date()) {
+  const { days, fromHour, toHour, weeks } = sched;
+  if (!days?.length || fromHour == null) return null;
+
+  const startOfToday = new Date(now);
+  startOfToday.setHours(0, 0, 0, 0);
+  const nowMin = (now - startOfToday) / 60000;
+  const to = toHour > fromHour ? toHour : fromHour + 1; // guard bad rows
+
+  for (let off = 0; off <= 35; off++) {
+    const d = new Date(startOfToday);
+    d.setDate(d.getDate() + off);
+    if (!days.includes(d.getDay())) continue;
+    // Which occurrence of this weekday in the month — the 1st Tuesday, the 3rd.
+    const nth = Math.ceil(d.getDate() / 7);
+    if (weeks?.length && !weeks.includes(nth)) continue;
+
+    const start = off * 1440 + fromHour * 60;
+    const end = off * 1440 + to * 60;
+    if (nowMin >= end) continue;
+    return nowMin >= start
+      ? { active: true, endsInMin: Math.round(end - nowMin), startsInMin: 0 }
+      : { active: false, endsInMin: null, startsInMin: Math.round(start - nowMin) };
+  }
+  return null;
+}
+
+const DAY_NAME = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const NTH = { 1: "1st", 2: "2nd", 3: "3rd", 4: "4th", 5: "5th" };
+
+function dayList(days) {
+  const d = [...new Set(days)].sort((a, b) => a - b);
+  if (d.length === 7) return "Every day";
+  const contiguous = d.every((v, i) => i === 0 || v === d[i - 1] + 1);
+  if (contiguous && d.length > 2) return `${DAY_NAME[d[0]]}–${DAY_NAME[d[d.length - 1]]}`;
+  return d.map((x) => DAY_NAME[x]).join(", ");
+}
+
+export function describeSweep(sched) {
+  const hh = (h) => `${String(h % 24).padStart(2, "0")}:00`;
+  const when = `${dayList(sched.days)} ${hh(sched.fromHour)}–${hh(sched.toHour)}`;
+  const everyWeek = !sched.weeks?.length || sched.weeks.length >= 5;
+  return everyWeek
+    ? when
+    : `${when}, ${sched.weeks.map((w) => NTH[w] || w).join("/")} of the month`;
+}
+
+// "in 25 min" / "in 3 hr 10 min" / "tomorrow 08:00"
+function inWords(mins) {
+  if (mins < 60) return `in ${mins} min`;
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  if (h < 24) return `in ${h} hr${m ? ` ${m} min` : ""}`;
+  return `in ${Math.round(h / 24)} day${Math.round(h / 24) === 1 ? "" : "s"}`;
+}
+
+// How much warning is worth giving. Beyond a couple of hours a sweeping window
+// is not a reason to avoid a space — you'll have moved the car by then.
+const RESTRICTION_HORIZON_MIN = 150;
+
+// =============================================================================
 // Legality — may I park here right now?
 // =============================================================================
 
@@ -130,13 +273,42 @@ export function checkLegality(spot, now = new Date()) {
   if (spot.maxStay && spot.maxStay <= 30)
     warnings.push(`${spot.maxStay} min max stay`);
 
-  // On-street rules — sweeping windows, permit hours, loading zones — are the
-  // ones that actually get you towed, and OSM barely carries them: in a
-  // downtown Portland sample, 2 of 130 kerb ways had any restriction tag at
-  // all, and none had a conditional one. Until those are evaluated properly, a
-  // kerb never shows a clean "you can park here" — we can't support the claim.
+  // Timed kerb rules — sweeping windows, rush-hour tow-away lanes, permit
+  // hours. These are the ones that actually get you towed, so a window that is
+  // running now blocks the spot outright, and one about to open warns.
+  for (const r of spot.restrictions || []) {
+    const s = statusOf(r, now);
+    if (!s) continue;
+
+    const until =
+      s.endsInMin != null
+        ? ` until ${fmtMin((now.getHours() * 60 + now.getMinutes() + s.endsInMin) % 1440)}`
+        : "";
+
+    // Fail towards blocking: a rule has to say explicitly that it merely
+    // conditions parking (a max stay, paid hours) to be downgraded to a
+    // warning. An unrecognised restriction that's in force is treated as one
+    // that stops you parking, because that error is a walk and the other is
+    // a tow.
+    if (s.active && r.blocks !== false) {
+      blockers.push(`${r.label} now —${until || " in progress"}`);
+    } else if (s.active) {
+      // In force, but it doesn't make parking illegal — a max stay or a
+      // paid-hours window is a condition on parking, not a prohibition.
+      warnings.push(`${r.label}${until}`);
+    } else if (s.startsInMin != null && s.startsInMin <= RESTRICTION_HORIZON_MIN) {
+      warnings.push(`${r.label} ${inWords(s.startsInMin)}`);
+    }
+  }
+
+  // Kerb rules are barely in OSM — in a downtown Portland sample, 2 of 130 kerb
+  // ways carried any restriction tag and none carried a conditional one. Where
+  // a city publishes its sweeping schedule we now know the answer, but with no
+  // source covering the block, silence is not the same as "you're fine", so it
+  // never shows a clean "you can park here".
   // Pushed last so a specific warning still wins the one-line slot in the list.
-  if (spot.geometry) warnings.push("Kerb rules aren't mapped — check posted signs");
+  if (spot.geometry && !spot.restrictionsChecked)
+    warnings.push("Kerb rules aren't mapped — check posted signs");
 
   return {
     ok: blockers.length === 0,
@@ -144,6 +316,14 @@ export function checkLegality(spot, now = new Date()) {
     blockers,
     warnings,
   };
+}
+
+// A restriction carries either an opening_hours-style spec (OSM conditionals)
+// or an Nth-weekday schedule (municipal sweeping feeds).
+function statusOf(r, now) {
+  if (r.schedule) return nextSweep(r.schedule, now);
+  if (r.spec) return windowStatus(r.spec, now);
+  return null;
 }
 
 const fmtMin = (m) =>

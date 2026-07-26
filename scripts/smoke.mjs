@@ -32,7 +32,8 @@ globalThis.fetch = (input, init) => {
 };
 
 const { findParking, distanceMeters } = await import("../sources.js");
-const { rankSpots, evaluateHours, demandAt, checkLegality } = await import("../engine.js");
+const { rankSpots, evaluateHours, demandAt, checkLegality, windowStatus, nextSweep, describeSweep } =
+  await import("../engine.js");
 
 let failures = 0;
 const check = (name, cond, extra = "") => {
@@ -67,6 +68,70 @@ console.log("\nopening_hours evaluator");
   check("private access blocks parking", priv.ok === false);
 }
 
+// ----------------------------------------------------- timed kerb restrictions
+
+console.log("\ntimed restrictions");
+{
+  // 2026-07-28 is a Tuesday; the 28th is the 4th Tuesday of the month.
+  const tueMid = new Date("2026-07-28T09:00:00");
+  const tueEarly = new Date("2026-07-28T07:35:00");
+
+  check("inside a conditional window",
+    windowStatus("Tu 08:00-10:00", tueMid)?.active === true);
+  check("25 min before it opens",
+    windowStatus("Tu 08:00-10:00", tueEarly)?.startsInMin === 25);
+  check("Mo-Fr range excludes Sunday",
+    windowStatus("Mo-Fr 07:00-09:00", new Date("2026-07-26T08:00:00"))?.active === false);
+  check("window crossing midnight is still open at 02:00",
+    windowStatus("Mo 22:00-06:00", new Date("2026-07-28T02:00:00"))?.active === true);
+  check("unparseable window is unknown, never a false all-clear",
+    windowStatus("whenever the mood strikes") === null);
+
+  const everyTue = { days: [2], fromHour: 8, toHour: 10, weeks: [1, 2, 3, 4, 5] };
+  const oddTue = { days: [2], fromHour: 8, toHour: 10, weeks: [1, 3, 5] };
+  check("sweeping schedule is active mid-window", nextSweep(everyTue, tueMid)?.active === true);
+  check("1st/3rd/5th route skips the 4th Tuesday",
+    nextSweep(oddTue, tueEarly)?.startsInMin > 7 * 1440,
+    `${nextSweep(oddTue, tueEarly)?.startsInMin} min away`);
+  check("merged weekdays read as a range",
+    describeSweep({ days: [1, 2, 3, 4, 5, 6, 0], fromHour: 2, toHour: 6 }) === "Every day 02:00–06:00");
+
+  // The whole point: a swept block must be blocked while the sweeper is due.
+  const block = (now) =>
+    checkLegality(
+      {
+        kind: "street",
+        geometry: [{ lat: 0, lon: 0 }, { lat: 0, lon: 0.001 }],
+        restrictions: [{ label: "Street sweeping", schedule: everyTue, blocks: true }],
+        restrictionsChecked: true,
+      },
+      now
+    );
+  check("sweeping in progress blocks the spot", block(tueMid).ok === false);
+  check("sweeping 25 min out warns but still allows it",
+    block(tueEarly).ok === true && block(tueEarly).warnings.length > 0);
+  check("sweeping a day away is not worth mentioning",
+    block(new Date("2026-07-27T09:00:00")).warnings.length === 0);
+  check("a block nobody has data for still says check the signs",
+    checkLegality({ kind: "street", geometry: [{ lat: 0, lon: 0 }] }, tueMid)
+      .warnings.some((w) => /posted signs/.test(w)));
+
+  // A max stay limits how long you may park, not whether you may — treating it
+  // as a blocker would drop perfectly legal spots off the list.
+  const maxStayNow = checkLegality(
+    {
+      kind: "street",
+      geometry: [{ lat: 0, lon: 0 }, { lat: 0, lon: 0.001 }],
+      restrictions: [{ label: "2 h max stay", spec: "Mo-Fr 09:00-18:00", blocks: false }],
+      restrictionsChecked: true,
+    },
+    tueMid
+  );
+  check("a conditional max stay warns but never blocks",
+    maxStayNow.ok === true && maxStayNow.warnings.length === 1,
+    maxStayNow.warnings.join(", "));
+}
+
 // ------------------------------------------------------------ demand curve
 
 console.log("\ndemand curve");
@@ -82,6 +147,7 @@ console.log("\ndemand curve");
 const PLACES = [
   { name: "Downtown Los Angeles (live sensors expected)", lat: 34.0487, lon: -118.2518 },
   { name: "Downtown Seattle", lat: 47.6079, lon: -122.3352 },
+  { name: "Union Square, San Francisco (sweeping expected)", lat: 37.7879, lon: -122.4075, sweeping: true },
 ];
 
 for (const place of PLACES) {
@@ -92,7 +158,8 @@ for (const place of PLACES) {
   const { spots, reports } = await findParking({ center, radiusM: 800, keys: {} });
   console.log(`  fetched in ${Date.now() - t0} ms`);
   for (const r of reports) {
-    console.log(`    ${r.ok ? "ok  " : "ERR "} ${r.label}: ${r.ok ? r.count + " spots" : r.error}`);
+    const unit = r.restriction ? "rules" : "spots";
+    console.log(`    ${r.ok ? "ok  " : "ERR "} ${r.label}: ${r.ok ? `${r.count} ${unit}` : r.error}`);
   }
 
   check("found at least one spot", spots.length > 0, `${spots.length} total`);
@@ -107,6 +174,29 @@ for (const place of PLACES) {
   check("scores are in 0..100", ranked.every((r) => r.avail.score >= 0 && r.avail.score <= 100));
   check("every result explains itself", ranked.every((r) => r.avail.reasons.length > 0));
   check("sorted best-first", ranked.every((r, i) => i === 0 || ranked[i - 1].rank >= r.rank));
+
+  if (place.sweeping) {
+    const kerbs = spots.filter((s) => s.kind === "street");
+    const swept = spots.filter((s) => s.restrictions?.length);
+    // Sweeping rules attach to kerbs, which come from OSM. If Overpass is down
+    // there is nothing to attach them to, and asserting otherwise would just be
+    // reporting someone else's outage as our bug.
+    if (!kerbs.length) {
+      console.log("  SKIP  sweeping attachment — no kerbs came back from OSM this run");
+    } else {
+    check("street sweeping schedules attached to blocks", swept.length > 0,
+      `${swept.length} of ${kerbs.length} kerbs`);
+    // Cross streets meet at right angles; a rule must run ALONG its block.
+    check("no block carries an implausible pile of rules",
+      swept.every((s) => s.restrictions.length <= 4),
+      `max ${Math.max(0, ...swept.map((s) => s.restrictions.length))}`);
+    check("every attached rule has a usable schedule",
+      swept.every((s) => s.restrictions.every((r) => r.schedule?.days?.length)));
+    for (const s of swept.slice(0, 3)) {
+      console.log(`    ${(s.name || "?").slice(0, 26).padEnd(28)}${s.restrictions.map((r) => describeSweep(r.schedule)).join(" | ")}`);
+    }
+    }
+  }
 
   const live = ranked.filter((r) => r.avail.confidence === "measured");
   if (live.length) {

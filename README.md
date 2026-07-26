@@ -39,6 +39,9 @@ tow, not a win. Availability and legality are computed independently.
   rare case of true measured street availability.
 - **Seattle occupancy history** — a real 2021 study of paid on-street occupancy,
   precomputed into a per-blockface, per-hour table (see below).
+- **SF street sweeping** — the full city schedule per blockface, matched to
+  kerbs so a spot that's about to be swept warns you and one being swept right
+  now drops out. See [Street sweeping](#street-sweeping-and-other-timed-rules).
 
 **Optional, key-gated** (the app is fully functional without them — add a key in
 Settings and the source switches itself on):
@@ -123,13 +126,73 @@ whole street is busy at once.
 a handful of US downtowns, and absent almost everywhere else. **A street with
 no line is not a street with no parking** — it's a street nobody has mapped.
 
-Worse, the rules that actually get you towed are barely mapped at all. In a
-downtown Portland sample, 2 of 130 kerb ways carried any restriction tag, and
-*none* carried a conditional one — so there is no street-sweeping data to
-evaluate even in a well-mapped city. Until that's fixed, a kerb never shows a
-clean "you can park here"; it always carries a check-the-signs caveat. Reading
-`parking:*:restriction:conditional` and the municipal sweeping datasets (LA and
-SF both publish theirs) is the next piece of work.
+---
+
+## Street sweeping and other timed rules
+
+Availability tells you whether a space is free. It says nothing about whether
+parking in it costs you $80 and a trip to the impound lot. Sweeping windows,
+rush-hour tow-away lanes and permit hours are computed separately, and a rule
+that's running right now removes the spot from the list entirely.
+
+Two sources feed this, and they are wildly unequal:
+
+**OSM conditional tags** — `parking:right:restriction:conditional =
+no_parking @ (Tu 08:00-10:00)` is exactly a sweeping window, and the schema also
+covers conditional `maxstay` and `fee`. Universal, and read wherever present.
+The catch is that it almost never *is* present: in the Portland sample, 2 of 130
+kerb ways carried any restriction tag and **none** carried a conditional one.
+
+**Municipal open data** — where the real coverage is. San Francisco publishes
+its full sweeping schedule per blockface with geometry, and it's wired up:
+
+```
+https://data.sfgov.org/resource/yhqp-riqs.json
+```
+
+38k rows city-wide, but the geometry column is indexed, so `within_circle` does
+the filtering server-side and returns in well under a second.
+
+LA deliberately isn't here. Its "Posted Street Sweeping Routes" dataset has no
+geometry and no weekday — just free text like `Chandler Bl. to Ventura Fwy /
+Colfax Av. to Laurel Cyn. Bl.` — which can't be matched to a block.
+
+### Matching rules to blocks is the hard part
+
+A sweeping route and an OSM kerb are two independent line drawings of the same
+street, so they have to be matched geometrically. Proximity alone is badly
+wrong: **every cross street comes within a few metres at the intersection.** A
+plain distance test hung 51 rules on one block of O'Farrell St, most of them
+belonging to Stockton St.
+
+The fix is to require the two lines to run roughly *parallel* — within 25° —
+which throws out cross streets because they meet at right angles. That took
+O'Farrell from 51 rules to 7, with zero cross-street matches across the sample.
+
+Then the seven collapse to one. A downtown block swept daily arrives as seven
+rows, one per weekday, so rules differing only in weekday are folded into
+`Every day 02:00–06:00`.
+
+Sides are deliberately **not** matched. The feed's left/right is relative to the
+city's centreline direction and OSM's is relative to the way's, and the two do
+not reliably agree. Over-warning about the far kerb is a nuisance;
+under-warning about yours is a tow.
+
+### What it does with the answer
+
+| When | Result |
+|---|---|
+| Window running now | **Blocker** — "Street sweeping now — until 06:00", spot drops out of the list |
+| Starts within 2.5 hours | **Warning** — "Street sweeping in 20 min" |
+| Further out | Shown in the detail sheet, no warning — you'll have moved by then |
+| No source covers the block | "Kerb rules aren't mapped — check posted signs" |
+
+That last row is the one to keep honest. A block with no rules attached is only
+reported as clear when a feed that *covers that city* actually answered;
+if the feed failed, or there is no feed, silence stays silence. Verified against
+live SF data: at Monday 03:00 the swept blocks are blocked, at 01:40 they warn,
+and by 07:00 the 02:00–06:00 routes are clear again while the 07:00–09:00 ones
+have taken over.
 
 ---
 
@@ -301,7 +364,7 @@ unless you configure a sync URL in Settings.
 
 | File | Role |
 |---|---|
-| `sources.js` | Data adapters + the registry that fans out across them |
+| `sources.js` | Data adapters, restriction overlays, and the registry that fans out across them |
 | `engine.js` | Legality, demand curve, availability scoring, ranking |
 | `storage.js` | Crowd reports, settings, "where did I park" — all local |
 | `app.js` | Map, list, detail sheet, PWA wiring |
