@@ -67,24 +67,73 @@ async function fetchJSON(url, opts = {}, timeoutMs = 25000) {
   }
 }
 
-// Overpass mirrors rate-limit (429) and go down constantly. Try each in turn;
-// a 429 from one mirror is normal, not a failure worth surfacing.
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// How long to give a mirror before bringing the next one in alongside it.
+const OVERPASS_HEDGE_MS = 3500;
+const OVERPASS_TIMEOUT_MS = 20000;
+
+// Overpass mirrors rate-limit (429) and go down constantly, and a sick one can
+// sit there for a minute before it fails. Trying them strictly in turn meant a
+// single bad mirror cost 30 s before the second was even attempted, and a bad
+// day cost 90 s to find out nothing was available. That's the "why is this
+// taking forever".
+//
+// So hedge: start the first mirror, and bring in the next one either when the
+// first has been quiet for OVERPASS_HEDGE_MS or the moment it fails. First
+// success wins and the rest are aborted. A healthy first mirror is still a
+// single request, so this doesn't casually triple the load on free
+// infrastructure that other people depend on.
 async function overpass(query) {
-  let lastErr;
-  for (const host of OVERPASS_HOSTS) {
+  const body = "data=" + encodeURIComponent(query);
+  const controllers = [];
+  let done = false;
+
+  const attempt = async (host) => {
+    if (done) throw new Error(`${host}: skipped`);
+    const ctl = new AbortController();
+    controllers.push(ctl);
+    const timer = setTimeout(() => ctl.abort(), OVERPASS_TIMEOUT_MS);
     try {
-      return await fetchJSON(
-        host,
-        { method: "POST", headers: OVERPASS_HEADERS, body: "data=" + encodeURIComponent(query) },
-        30000
-      );
-    } catch (e) {
-      lastErr = e;
+      const r = await fetch(host, {
+        method: "POST",
+        headers: OVERPASS_HEADERS,
+        body,
+        signal: ctl.signal,
+      });
+      if (!r.ok) throw new Error(`${host}: HTTP ${r.status}`);
+      return await r.json();
+    } finally {
+      clearTimeout(timer);
     }
+  };
+
+  // Resolves only when `p` REJECTS. A mirror that succeeded must not open the
+  // next gate — that would fire a request we're about to abort anyway.
+  const rejected = (p) => p.then(() => new Promise(() => {}), () => {});
+
+  const attempts = [];
+  let gate = Promise.resolve(); // the first mirror goes immediately
+  for (const host of OVERPASS_HOSTS) {
+    const opensNow = gate;
+    const a = opensNow.then(() => attempt(host));
+    attempts.push(a);
+    // The next mirror waits out the hedge measured from THIS one's start — not
+    // from t=0, or every gate would open at once — or jumps in early the moment
+    // this one fails. No point waiting on a mirror that 429'd instantly.
+    gate = Promise.race([opensNow.then(() => sleep(OVERPASS_HEDGE_MS)), rejected(a)]);
   }
-  throw new Error(
-    `all Overpass mirrors unavailable (last: ${lastErr?.message || "unknown"})`
-  );
+
+  try {
+    return await Promise.any(attempts);
+  } catch (agg) {
+    const why = (agg.errors || []).map((e) => e.message).join("; ");
+    throw new Error(`all Overpass mirrors unavailable (${why || "unknown"})`);
+  } finally {
+    // Whoever won, stop the others talking to the network.
+    done = true;
+    for (const c of controllers) c.abort();
+  }
 }
 
 const num = (v) => {
@@ -854,14 +903,66 @@ function dedupe(spots) {
 
 // Free geocoding for the search box. Nominatim asks for modest use — we only
 // call it on explicit submit, never per keystroke.
-export async function geocode(query) {
-  const url =
-    "https://nominatim.openstreetmap.org/search?format=json&limit=5&q=" +
-    encodeURIComponent(query);
-  const rows = await fetchJSON(url, { headers: { Accept: "application/json" } });
+//
+// Searching by name is close to useless without a location: from Portland,
+// "Broadway" returns the Bronx and "City Hall" returns London. A soft viewbox
+// hint (bounded=0) barely reorders anything — measured, it left the Bronx on
+// top — so the local pass genuinely restricts to the box (bounded=1), and only
+// if that finds nothing do we repeat the search worldwide.
+//
+// The result: "Broadway" finds the one a kilometre away, and "Times Square
+// New York" still works. Two round trips, but only on the miss.
+const GEO_BOX_DEG = 0.35; // ~35 km — city-sized, not neighbourhood-sized
+
+export async function geocode(query, near = null) {
+  const run = async (bounded) => {
+    const params = new URLSearchParams({
+      format: "json",
+      limit: "8",
+      addressdetails: "1",
+      q: query,
+    });
+    if (bounded !== null) {
+      const d = GEO_BOX_DEG;
+      params.set(
+        "viewbox",
+        `${near.lon - d},${near.lat + d},${near.lon + d},${near.lat - d}`
+      );
+      params.set("bounded", bounded);
+    }
+    return fetchJSON(
+      `https://nominatim.openstreetmap.org/search?${params}`,
+      { headers: { Accept: "application/json" } },
+      12000
+    );
+  };
+
+  const canBias = near && Number.isFinite(near.lat) && Number.isFinite(near.lon);
+  let rows = canBias ? await run("1") : await run(null);
+  if (!rows.length && canBias) rows = await run(null);
+
   return rows.map((r) => ({
     label: r.display_name,
+    short: shortLabel(r),
     lat: parseFloat(r.lat),
     lon: parseFloat(r.lon),
   }));
+}
+
+// display_name is a full postal address — "Southwest Broadway, Downtown,
+// Portland, Multnomah County, Oregon, 97205, United States" — which is
+// unreadable in a list of five. Keep the name and enough context to tell two
+// candidates apart.
+function shortLabel(r) {
+  const a = r.address || {};
+  const name =
+    r.name ||
+    a.road ||
+    a.pedestrian ||
+    a.amenity ||
+    a.building ||
+    String(r.display_name).split(",")[0];
+  const place = a.city || a.town || a.village || a.suburb || a.county;
+  const region = a.state || a.country;
+  return [name, place, region].filter(Boolean).join(", ");
 }

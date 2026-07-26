@@ -453,12 +453,16 @@ html, body {
 
 .parked-pin { font-size: 24px; text-align: center; line-height: 30px; filter: drop-shadow(0 2px 4px rgba(0,0,0,.6)); }
 
-/* The install banner floats over the map, so it pairs the action with an
-   explicit dismiss. Hiding it is remembered; Settings brings it back. */
+/* The install banner pairs the action with an explicit dismiss; hiding it is
+   remembered, and Settings brings it back.
+   It's a child of the sheet and anchored to the sheet's top edge, so the
+   collapse transform carries it down too. Anchoring it to the viewport instead
+   left it floating over the middle of the map whenever the sheet was pulled
+   down — the button looked detached from anything. */
 .install-bar {
-  position: fixed;
+  position: absolute;
   left: 50%;
-  bottom: calc(var(--sheet-h) + 12px + var(--safe-b));
+  bottom: calc(100% + 12px);
   transform: translateX(-50%);
   z-index: 700;
   display: flex;
@@ -513,7 +517,10 @@ html, body {
   .sheet.collapsed { transform: none; }
   .sheet-grip { display: none; }
   .topbar { right: 420px; }
-  .install-bar { bottom: 20px; left: 30%; }
+  /* The side panel is full height here, so there is no top edge to sit above —
+     put it back over the map. The panel never transforms at this width, so a
+     fixed child is still positioned against the viewport. */
+  .install-bar { position: fixed; bottom: 20px; left: 30%; }
 }
 
 /* Respect a light-theme preference without losing map contrast. */

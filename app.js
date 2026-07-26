@@ -507,21 +507,29 @@ $("searchForm").addEventListener("submit", async (e) => {
   if (!q) return;
   showStatus("Looking up that place…", true);
   try {
-    const hits = await geocode(q);
+    // Bias to wherever the user is already looking, so a street name resolves
+    // to the one near them rather than the same name in another country. The
+    // map starts zoomed out over the whole country, though, and biasing to the
+    // middle of Kansas helps nobody — so only trust the map centre once it's
+    // actually been moved somewhere.
+    const c = map.getCenter();
+    const near = state.center || (map.getZoom() >= 8 ? { lat: c.lat, lon: c.lng } : null);
+    const hits = await geocode(q, near);
     if (!hits.length) return showStatus("No match for that address.", false, 3000);
     if (hits.length === 1) {
       $("geoResults").classList.add("hidden");
-      return runSearch({ lat: hits[0].lat, lon: hits[0].lon }, hits[0].label.split(",")[0]);
+      return runSearch({ lat: hits[0].lat, lon: hits[0].lon }, hits[0].short);
     }
     const box = $("geoResults");
     box.innerHTML = "";
     hits.forEach((h) => {
       const b = document.createElement("button");
-      b.textContent = h.label;
+      b.textContent = h.short;
+      b.title = h.label;
       b.onclick = () => {
         box.classList.add("hidden");
         $("searchInput").blur();
-        runSearch({ lat: h.lat, lon: h.lon }, h.label.split(",")[0]);
+        runSearch({ lat: h.lat, lon: h.lon }, h.short);
       };
       box.appendChild(b);
     });

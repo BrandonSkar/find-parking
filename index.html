@@ -57,6 +57,13 @@
   <ul id="list" class="list"></ul>
 
   <div id="sourceNote" class="source-note"></div>
+
+  <!-- Lives inside the sheet so it rides with it when the sheet is dragged
+       down, rather than being stranded in the middle of the map. -->
+  <div id="installBar" class="install-bar hidden">
+    <button id="installBtn" class="install-btn">⬇︎ Add to Home Screen</button>
+    <button id="installDismiss" class="install-dismiss" title="Not now — you can bring this back in Settings" aria-label="Hide install prompt">✕</button>
+  </div>
 </section>
 
 <!-- ===================== SPOT DETAIL ===================== -->
@@ -110,11 +117,6 @@
     <ul class="src-list" id="srcList"></ul>
   </div>
 </section>
-
-<div id="installBar" class="install-bar hidden">
-  <button id="installBtn" class="install-btn">⬇︎ Add to Home Screen</button>
-  <button id="installDismiss" class="install-dismiss" title="Not now — you can bring this back in Settings" aria-label="Hide install prompt">✕</button>
-</div>
 
 <script src="vendor/leaflet/leaflet.js"></script>
 <script type="module" src="app.js"></script>
